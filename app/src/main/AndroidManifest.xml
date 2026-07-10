@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Xposed module metadata -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    
+    <application
+        android:label="wxcode"
+        android:allowBackup="true"
+        android:supportsRtl="true">
+        
+        <!-- Xposed模块声明 -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true"/>
+        <meta-data
+            android:name="xposeddescription"
+            android:value="微信小程序登录Hook模块(支持分身)"/>
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82"/>
+        <!-- LSPosed支持多作用域，使用逗号分隔或留空让用户手动选择 -->
+        <meta-data
+            android:name="xposedscope"
+            android:value="com.tencent.mm,com.tencent.mm:dual,com.tencent.mm.clone"/>
+        <!-- 提示：如有其他分身包名，请在LSPosed中手动勾选作用域 -->
+    </application>
+</manifest>

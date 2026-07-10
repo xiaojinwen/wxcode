@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:versionCode="10"
+    android:versionName="2.0"
+    android:compileSdkVersion="33"
+    android:compileSdkVersionCodename="13"
+    package="xiaojw.wxcode"
+    platformBuildVersionCode="33"
+    platformBuildVersionName="13">
+    <uses-sdk
+        android:minSdkVersion="17"
+        android:targetSdkVersion="28"/>
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <application
+        android:label="wxcode"
+        android:debuggable="true"
+        android:allowBackup="true"
+        android:supportsRtl="true">
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true"/>
+        <meta-data
+            android:name="xposeddescription"
+            android:value="http://127.0.0.1:8088/login?appId="/>
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82"/>
+        <meta-data
+            android:name="xposedscope"
+            android:value="com.tencent.mm"/>
+    </application>
+</manifest>
