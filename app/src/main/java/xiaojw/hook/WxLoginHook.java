@@ -4,13 +4,16 @@ import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
+import android.os.Binder;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.app.ActivityManager;
@@ -56,6 +59,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private HandlerThread workerThread;
     private Handler workerHandler;
     private boolean isForegroundServiceRunning = false;
+    private boolean tempForegroundStarted = false; // 标记本次登录是否临时拉起前台Service，用于登录后释放
     private PowerManager.WakeLock wakeLock;
     private Application wechatApplication;
     private Activity fakeTopActivity;
@@ -81,6 +85,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private int httpPort = 8088;
     // 主端口：所有分身实例向该端口(用户0的8088)发送注册通知，由其汇总所有启动的端口
     private static final int MASTER_PORT = 8088;
+    // 前台保活 Service 通知ID与渠道ID（真正提升进程优先级，避免后台网络限流）
+    private static final int FOREGROUND_NOTIF_ID = 1001;
+    private static final String FOREGROUND_CHANNEL_ID = "wxcode_foreground_keepalive";
 
     // 内存实例表：跨用户实例通过向主端口注册通知汇聚，无需共享文件系统即可多用户共享
     private final Object instanceLock = new Object();
@@ -412,36 +419,57 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 前台保活模式：WakeLock+常驻通知提升进程优先级
+     * 前台保活模式：真正启动一个前台 Service，将进程优先级提升到前台，
+     * 从而绕过系统对后台应用的网络限流/Doze延迟，并规避"后台启动Activity被拦截"的问题。
+     * （注意：必须在 AndroidManifest.xml 中声明 KeepAliveService）
      */
     private void startForegroundService() {
         if (isForegroundServiceRunning) return;
         try {
+            // 常驻 WakeLock：保持CPU唤醒，配合前台Service一起使用（3分钟上限，避免长期后台耗电）
             PowerManager pm = (PowerManager) appContext.getSystemService(Context.POWER_SERVICE);
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wxcode:wakelock_" + currentPackageName);
-            wakeLock.acquire(10 * 60 * 1000L);
-            String channelId = "wxcode_service_" + currentPackageName;
-            NotificationManager nm = (NotificationManager) appContext.getSystemService(Context.NOTIFICATION_SERVICE);
+            wakeLock.acquire(3 * 60 * 1000L);
+            // 真正启动前台 Service（API26+ 用 startForegroundService，低版本用 startService）
+            Intent intent = new Intent(appContext, KeepAliveService.class);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                NotificationChannel channel = new NotificationChannel(channelId, "wxcode后台服务", NotificationManager.IMPORTANCE_LOW);
-                channel.setDescription("wxcode HTTP服务保活");
-                channel.setShowBadge(false);
-                nm.createNotificationChannel(channel);
+                appContext.startForegroundService(intent);
+            } else {
+                appContext.startService(intent);
             }
-            Notification.Builder builder = new Notification.Builder(appContext)
-                    .setContentTitle("wxcode 服务运行中")
-                    .setContentText(currentPackageName + " HTTP端口:" + httpPort)
-                    .setSmallIcon(android.R.drawable.ic_dialog_info)
-                    .setPriority(Notification.PRIORITY_LOW)
-                    .setOngoing(true);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) builder.setChannelId(channelId);
-            nm.notify(httpPort, builder.build());
             isForegroundServiceRunning = true;
-            XposedBridge.log(TAG + " 前台保活模式已启动");
+            XposedBridge.log(TAG + " 前台保活Service已启动（进程优先级提升至前台）");
         } catch (Exception e) {
-            XposedBridge.log(TAG + " 前台服务启动失败:" + e.getMessage());
+            XposedBridge.log(TAG + " 前台Service启动失败:" + e.getMessage());
             if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+            wakeLock = null;
             startWorkerThread();
+        }
+    }
+
+    /**
+     * 停止前台保活 Service 并释放 WakeLock
+     */
+    private void stopForegroundService() {
+        try {
+            appContext.stopService(new Intent(appContext, KeepAliveService.class));
+        } catch (Exception ignored) {}
+        if (wakeLock != null && wakeLock.isHeld()) {
+            try { wakeLock.release(); } catch (Exception ignored) {}
+        }
+        wakeLock = null;
+        isForegroundServiceRunning = false;
+    }
+
+    /**
+     * 后台登录时确保前台保活 Service 已拉起，避免接口请求被系统限流卡住。
+     * 与临时拉起Activity相比，前台Service在 Android 10+ 上不受"后台启动Activity"限制，
+     * 且能真正提升进程优先级，是后台可靠性的关键。
+     */
+    private void ensureForegroundForBackground() {
+        if (!isForegroundServiceRunning) {
+            startForegroundService();
+            tempForegroundStarted = true;
         }
     }
 
@@ -579,8 +607,10 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + " 发起登录 appId=" + str);
             boolean needWake = !isWeChatForeground();
             if (needWake) {
+                // 后台态：Android 10+ 禁止后台启动Activity，故用前台Service提升进程优先级，
+                // 真正解决后台接口请求被系统限流/卡住的问题；tempWakeupWeChat 仅作尽力而为的兜底。
+                ensureForegroundForBackground();
                 tempWakeupWeChat();
-                Thread.sleep(1000);
             }
             forceForegroundState(classLoader);
             Object loginTask = XposedHelpers.newInstance(LoginTaskCls);
@@ -606,10 +636,14 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             if (MODE_TEMP_WAKEUP.equals(currentMode)) {
                 tempWakeupWeChat();
                 handler = new Handler(Looper.getMainLooper());
-            } else if (MODE_WORKER_THREAD.equals(currentMode) && workerHandler != null) {
+            } else if (MODE_WORKER_THREAD.equals(currentMode) && workerHandler != null && workerThread != null && workerThread.isAlive()) {
                 handler = workerHandler;
             } else {
-                handler = new Handler(Looper.getMainLooper());
+                // 兜底：worker线程未就绪时重建，避免使用已失效的handler导致轮询任务永远不执行
+                if (workerHandler == null || workerThread == null || !workerThread.isAlive()) {
+                    startWorkerThread();
+                }
+                handler = workerHandler != null ? workerHandler : new Handler(Looper.getMainLooper());
             }
             Object lockObj = new Object();
             Runnable pollTask = new Runnable() {
@@ -651,6 +685,11 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         } finally {
             isLoginInFlight = false;
             restoreForegroundState();
+            // 若本次登录是临时拉起的前台Service，登录结束后释放，避免长期常驻耗电
+            if (tempForegroundStarted) {
+                stopForegroundService();
+                tempForegroundStarted = false;
+            }
             if (tempWakeLock != null && tempWakeLock.isHeld()) {
                 tempWakeLock.release();
             }
@@ -1100,6 +1139,47 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 e.printStackTrace();
                 return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, NanoHTTPD.MIME_PLAINTEXT, "服务器内部错误");
             }
+        }
+    }
+
+    /**
+     * 前台保活 Service：用于把微信进程优先级提升到前台，避免后台网络被系统限流/Doze延迟。
+     * 必须是 public static，否则框架无法用默认构造器实例化。
+     * 注意：需在 AndroidManifest.xml 中声明 <service android:name=".hook.WxLoginHook$KeepAliveService" />。
+     */
+    public static class KeepAliveService extends Service {
+        @Override
+        public void onCreate() {
+            super.onCreate();
+        }
+
+        @Override
+        public int onStartCommand(Intent intent, int flags, int startId) {
+            // 立即调用 startForeground，否则系统会抛出 ForegroundServiceDidNotStartInTimeException
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                NotificationChannel channel = new NotificationChannel(
+                        FOREGROUND_CHANNEL_ID, "wxcode后台保活", NotificationManager.IMPORTANCE_LOW);
+                channel.setDescription("wxcode HTTP服务保活，避免后台网络被限流");
+                channel.setShowBadge(false);
+                nm.createNotificationChannel(channel);
+            }
+            Notification notification = new Notification.Builder(this)
+                    .setContentTitle("wxcode 服务运行中")
+                    .setContentText("后台保活中，避免接口请求被限流")
+                    .setSmallIcon(android.R.drawable.ic_dialog_info)
+                    .setPriority(Notification.PRIORITY_LOW)
+                    .setOngoing(true)
+                    .setChannelId(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? FOREGROUND_CHANNEL_ID : null)
+                    .build();
+            startForeground(FOREGROUND_NOTIF_ID, notification);
+            // START_STICKY：被系统回收后尽量重建，保持后台可靠性
+            return START_STICKY;
+        }
+
+        @Override
+        public IBinder onBind(Intent intent) {
+            return null;
         }
     }
 }

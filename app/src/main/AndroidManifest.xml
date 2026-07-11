@@ -24,5 +24,11 @@
             android:name="xposedscope"
             android:value="com.tencent.mm"/>
         <!-- 系统分身与主应用包名相同，勾选 com.tencent.mm 即可覆盖所有实例 -->
+
+        <!-- 前台保活 Service：把微信进程优先级提升到前台，解决后台接口请求被限流卡住的问题 -->
+        <service
+            android:name=".hook.WxLoginHook$KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>
