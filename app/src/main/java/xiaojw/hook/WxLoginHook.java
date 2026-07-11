@@ -8,6 +8,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
+import android.os.Environment;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -16,6 +17,7 @@ import android.os.Looper;
 import android.os.PowerManager;
 import android.app.ActivityManager;
 import android.app.Application;
+import android.os.UserHandle;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -27,6 +29,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.time.LocalDateTime;
 import java.util.Iterator;
 import java.util.LinkedList;
@@ -39,8 +42,11 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private static final String DEFAULT_AUTO_APP_ID = "wxaa3a999db5d744c6";
     private static final String TAG = "xiaojw-wxcode";
     private static final String WECHAT_PACKAGE_PREFIX = "com.tencent.mm";
-    // 共享文件路径：用于记录所有已启动的微信实例
-    private static final String REGISTRY_FILE = "/data/local/tmp/wxcode_registry.json";
+
+    // 注册表文件路径（使用外部存储，普通应用可写入）
+    // 方案1: 外部存储公共目录（需要存储权限，但大多数设备已授权）
+    // 方案2: 如果外部存储不可用，回退到应用私有目录（但无法跨进程共享）
+    private String registryFilePath = null;
 
     // 执行模式常量
     private static final String MODE_FOREGROUND_SERVICE = "foreground_service";  // 前台服务保活
@@ -76,6 +82,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private String c = "he0.c";
     private String versionName = "000";
     private String currentPackageName = "";
+    private int currentUserId = 0;  // 当前实例的 User ID（用于区分系统级分身）
     private int httpPort = 8088;
 
     /**
@@ -101,50 +108,172 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 根据包名计算HTTP端口，确保不同分身使用不同端口
-     * 端口分配策略:
-     * - 原始微信(com.tencent.mm): 8088
-     * - 常见分身格式按后缀分配固定端口
-     * - 其他格式使用包名哈希在大范围内分配
+     * 初始化注册表文件路径
+     * 优先使用外部存储公共目录，确保不同进程可以共享
      */
-    private int calculatePort(String packageName) {
-        if (packageName.equals("com.tencent.mm")) {
-            return 8088; // 原始微信使用默认端口
+    private void initRegistryFilePath() {
+        // 优先方案：外部存储公共目录（Android 10+ 需要特殊处理）
+        try {
+            File externalDir = Environment.getExternalStorageDirectory();
+            if (externalDir != null && externalDir.canWrite()) {
+                registryFilePath = externalDir.getAbsolutePath() + "/wxcode_registry.json";
+                XposedBridge.log(TAG + " [" + currentPackageName + "] 使用外部存储注册表: " + registryFilePath);
+                return;
+            }
+        } catch (Exception e) {
+            XposedBridge.log(TAG + " [" + currentPackageName + "] 外部存储不可用: " + e.getMessage());
         }
 
-        // 常见分身后缀的固定端口映射
-        if (packageName.endsWith(":dual")) return 8089;
-        if (packageName.endsWith(":clone")) return 8090;
-        if (packageName.endsWith("_1")) return 8091;
-        if (packageName.endsWith("_2")) return 8092;
-        if (packageName.endsWith("_xiaomi")) return 8093;
-        if (packageName.endsWith(".dual")) return 8094;
-        if (packageName.endsWith(".clone")) return 8095;
-
-        // 其他格式：使用完整包名计算更独特的端口
-        // 将包名每个字符的ASCII值累加，确保更均匀分布
-        int sum = 0;
-        for (int i = "com.tencent.mm".length(); i < packageName.length(); i++) {
-            sum += packageName.charAt(i);
+        // 方案2：应用私有外部存储目录（Android 10+ 推荐，无需权限）
+        try {
+            if (appContext != null) {
+                File appExternalDir = appContext.getExternalFilesDir(null);
+                if (appExternalDir != null) {
+                    // 使用固定路径名，不同应用都能访问（需要同一包名）
+                    // 由于分身包名相同，这里的路径实际上指向不同用户的数据目录
+                    registryFilePath = appExternalDir.getAbsolutePath() + "/wxcode_registry.json";
+                    XposedBridge.log(TAG + " [" + currentPackageName + "] 使用应用外部存储注册表: " + registryFilePath);
+                    return;
+                }
+            }
+        } catch (Exception e) {
+            XposedBridge.log(TAG + " [" + currentPackageName + "] 应用外部存储不可用: " + e.getMessage());
         }
-        // 端口范围: 8096 - 8995，约900个端口，足够避免冲突
-        int port = 8096 + (sum % 900);
-        XposedBridge.log(TAG + " 计算端口: " + packageName + " -> " + port);
-        return port;
+
+        // 方案3：尝试使用 /data/local/tmp（可能需要 root 提前创建并 chmod 777）
+        registryFilePath = "/data/local/tmp/wxcode_registry.json";
+        XposedBridge.log(TAG + " [" + currentPackageName + "] 回退使用 /data/local/tmp（可能需要 root 权限）: " + registryFilePath);
+    }
+
+    /**
+     * 获取当前进程的 User ID
+     * 用于区分系统级分身（同一包名，不同用户空间）
+     *
+     * Android 多用户机制:
+     * - 主用户: User ID = 0
+     * - 工作资料: User ID = 10, 11, ...
+     * - 系统分身: User ID 通常是 999, 888 等特殊值
+     */
+    private int getUserId() {
+        try {
+            // 方法1: 通过 UserHandle.myUserId() 反射调用（Android @hide API）
+            Method myUserIdMethod = UserHandle.class.getDeclaredMethod("myUserId");
+            myUserIdMethod.setAccessible(true);
+            int userId = (int) myUserIdMethod.invoke(null);
+            XposedBridge.log(TAG + " [" + currentPackageName + "] 通过 UserHandle.myUserId() 获取 User ID: " + userId);
+            return userId;
+        } catch (Exception e1) {
+            XposedBridge.log(TAG + " [" + currentPackageName + "] UserHandle.myUserId() 失败: " + e1.getMessage());
+        }
+
+        try {
+            // 方法2: 通过 Process.myUserHandle() 获取 UserHandle，然后反射获取 userId
+            UserHandle userHandle = android.os.Process.myUserHandle();
+            if (userHandle != null) {
+                Field userIdField = UserHandle.class.getDeclaredField("mHandle");
+                userIdField.setAccessible(true);
+                int userId = userIdField.getInt(userHandle);
+                XposedBridge.log(TAG + " [" + currentPackageName + "] 通过 Process.myUserHandle() 获取 User ID: " + userId);
+                return userId;
+            }
+        } catch (Exception e2) {
+            XposedBridge.log(TAG + " [" + currentPackageName + "] Process.myUserHandle() 失败: " + e2.getMessage());
+        }
+
+        try {
+            // 方法3: 通过数据目录路径解析 /data/user/{userId}/com.tencent.mm
+            String dataDir = appContext.getDataDir() != null ? appContext.getDataDir().getAbsolutePath() : null;
+            if (dataDir != null && dataDir.contains("/data/user/")) {
+                // 路径格式: /data/user/{userId}/com.tencent.mm
+                String[] parts = dataDir.split("/");
+                if (parts.length >= 4 && "data".equals(parts[1]) && "user".equals(parts[2])) {
+                    int userId = Integer.parseInt(parts[3]);
+                    XposedBridge.log(TAG + " [" + currentPackageName + "] 通过数据目录获取 User ID: " + userId);
+                    return userId;
+                }
+            }
+        } catch (Exception e3) {
+            XposedBridge.log(TAG + " [" + currentPackageName + "] 数据目录解析失败: " + e3.getMessage());
+        }
+
+        // 默认返回 0（主用户）
+        XposedBridge.log(TAG + " [" + currentPackageName + "] 无法获取 User ID，默认使用 0（主用户）");
+        return 0;
+    }
+
+    /**
+     * 根据包名和 User ID 计算HTTP端口，确保不同分身使用不同端口
+     * 端口分配策略:
+     * - 系统级分身（同一包名，不同 User ID）: 基于 User ID 偏移
+     * - 包名后缀分身（如 :dual, _1）: 固定端口映射
+     * - 其他格式: 动态计算
+     *
+     * 端口计算公式: 基础端口 + User ID 偏移 + 包名后缀偏移
+     */
+    private int calculatePort(String packageName, int userId) {
+        int basePort = 8088;  // 原始微信的基础端口
+
+        // 系统级分身（同一包名，不同 User ID）: 每个用户增加 1 端口偏移
+        // User ID 0 → 8088, User ID 999 → 8088+999=9087（超过范围需要处理）
+        if (userId > 0) {
+            // 为避免端口冲突，使用更合理的偏移策略
+            // User ID 10-99: 基础端口 + userId (8088+10=8098)
+            // User ID >= 100: 使用哈希映射到安全范围
+            if (userId < 100) {
+                basePort = basePort + userId;
+            } else {
+                // 大 User ID（如系统分身 999）使用哈希映射到 8100-8200 范围
+                basePort = 8100 + (userId % 100);
+            }
+            XposedBridge.log(TAG + " [" + packageName + "] User ID " + userId + " 端口偏移: " + basePort);
+        }
+
+        // 如果不是原始包名，再叠加包名后缀的额外偏移
+        if (!packageName.equals("com.tencent.mm")) {
+            // 常见分身后缀的固定额外偏移（叠加到 User ID 基础上）
+            if (packageName.endsWith(":dual")) return basePort + 1;
+            if (packageName.endsWith(":clone")) return basePort + 2;
+            if (packageName.endsWith("_1")) return basePort + 3;
+            if (packageName.endsWith("_2")) return basePort + 4;
+            if (packageName.endsWith("_xiaomi")) return basePort + 5;
+            if (packageName.endsWith(".dual")) return basePort + 6;
+            if (packageName.endsWith(".clone")) return basePort + 7;
+
+            // 其他格式：使用包名哈希计算额外偏移
+            int sum = 0;
+            for (int i = "com.tencent.mm".length(); i < packageName.length(); i++) {
+                sum += packageName.charAt(i);
+            }
+            // 叠加偏移范围: 8-107（避免与上面固定映射冲突）
+            int extraOffset = 8 + (sum % 100);
+            int port = basePort + extraOffset;
+
+            // 确保端口不超过合理范围（最大 9000）
+            if (port > 9000) {
+                port = 8096 + ((port - 8096) % 900);
+            }
+
+            XposedBridge.log(TAG + " [" + packageName + "] 包名后缀偏移: " + extraOffset + ", 最终端口: " + port);
+            return port;
+        }
+
+        XposedBridge.log(TAG + " [" + packageName + "] 计算端口: " + basePort + " (User ID: " + userId + ")");
+        return basePort;
     }
 
     /**
      * 注册当前实例到共享文件
      * 所有微信实例启动时都会写入自己的信息，实现跨进程发现
      */
-    private void registerInstance(String packageName, int port, String version) {
+    private void registerInstance(String packageName, int userId, int port, String version) {
         try {
             JSONArray registry = readRegistry();
 
-            // 移除旧记录（如果已存在）
+            // 移除旧记录（如果已存在，同时匹配 packageName 和 userId）
             for (int i = 0; i < registry.length(); i++) {
                 JSONObject item = registry.getJSONObject(i);
-                if (item.getString("packageName").equals(packageName)) {
+                if (item.getString("packageName").equals(packageName) &&
+                    item.getInt("userId") == userId) {
                     registry.remove(i);
                     break;
                 }
@@ -153,6 +282,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             // 添加新记录
             JSONObject instance = new JSONObject();
             instance.put("packageName", packageName);
+            instance.put("userId", userId);
             instance.put("port", port);
             instance.put("version", version);
             instance.put("registerTime", System.currentTimeMillis());
@@ -160,7 +290,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
 
             // 写入文件
             writeRegistry(registry);
-            XposedBridge.log(TAG + " 实例已注册: " + packageName + ":" + port);
+            XposedBridge.log(TAG + " 实例已注册: " + packageName + " (User " + userId + ") :" + port);
         } catch (Exception e) {
             XposedBridge.log(TAG + " 注册实例失败: " + e.getMessage());
         }
@@ -171,8 +301,12 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      */
     private JSONArray readRegistry() {
         try {
-            File file = new File(REGISTRY_FILE);
+            if (registryFilePath == null) {
+                initRegistryFilePath();
+            }
+            File file = new File(registryFilePath);
             if (!file.exists()) {
+                XposedBridge.log(TAG + " [" + currentPackageName + "] 注册表文件不存在: " + registryFilePath);
                 return new JSONArray();
             }
             FileInputStream fis = new FileInputStream(file);
@@ -181,7 +315,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             fis.close();
             return new JSONArray(new String(data, "UTF-8"));
         } catch (Exception e) {
-            XposedBridge.log(TAG + " 读取注册表失败: " + e.getMessage());
+            XposedBridge.log(TAG + " [" + currentPackageName + "] 读取注册表失败: " + e.getMessage());
             return new JSONArray();
         }
     }
@@ -191,15 +325,25 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      */
     private void writeRegistry(JSONArray registry) {
         try {
-            File file = new File(REGISTRY_FILE);
+            if (registryFilePath == null) {
+                initRegistryFilePath();
+            }
+            File file = new File(registryFilePath);
+            // 如果父目录不存在，创建目录
+            File parentDir = file.getParentFile();
+            if (parentDir != null && !parentDir.exists()) {
+                parentDir.mkdirs();
+                XposedBridge.log(TAG + " [" + currentPackageName + "] 创建目录: " + parentDir.getAbsolutePath());
+            }
             FileOutputStream fos = new FileOutputStream(file);
             fos.write(registry.toString().getBytes("UTF-8"));
             fos.close();
             // 设置文件权限为可读写（所有进程都能访问）
             file.setReadable(true, false);
             file.setWritable(true, false);
+            XposedBridge.log(TAG + " [" + currentPackageName + "] 注册表写入成功: " + registryFilePath);
         } catch (Exception e) {
-            XposedBridge.log(TAG + " 写入注册表失败: " + e.getMessage());
+            XposedBridge.log(TAG + " [" + currentPackageName + "] 写入注册表失败: " + e.getMessage() + " | 路径: " + registryFilePath);
         }
     }
 
@@ -618,8 +762,8 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             return;
         }
         currentPackageName = loadPackageParam.packageName;
-        httpPort = calculatePort(currentPackageName);
-        XposedBridge.log(TAG + " 检测到微信包: " + currentPackageName + ", 端口: " + httpPort);
+        // 注意：此时还不能获取 userId，需要等 Application.attach 后才能获取 context
+        XposedBridge.log(TAG + " 检测到微信包: " + currentPackageName);
         try {
             Class<?> cls = Class.forName("android.app.Application");
             Object[] objArr = new Object[2];
@@ -631,10 +775,20 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                         super.afterHookedMethod(methodHookParam);
                         Context context = (Context) methodHookParam.args[0];
                         ClassLoader classLoader = context.getClassLoader();
+
+                        // 先设置 appContext，才能获取 userId（getUserId 需要 appContext）
+                        WxLoginHook.this.appContext = context;
+
+                        // 获取当前实例的 User ID（区分系统级分身）
+                        WxLoginHook.this.currentUserId = WxLoginHook.this.getUserId();
+
+                        // 根据 User ID 和包名计算端口
+                        WxLoginHook.this.httpPort = WxLoginHook.this.calculatePort(WxLoginHook.this.currentPackageName, WxLoginHook.this.currentUserId);
+
                         // 使用当前包名获取版本信息（支持分身）
                         PackageInfo packageInfo = context.getPackageManager().getPackageInfo(WxLoginHook.this.currentPackageName, 0);
                         WxLoginHook.this.versionName = packageInfo.versionName;
-                        XposedBridge.log(TAG + " [" + WxLoginHook.this.currentPackageName + "] 当前版本: " + WxLoginHook.this.versionName);
+                        XposedBridge.log(TAG + " [" + WxLoginHook.this.currentPackageName + " User:" + WxLoginHook.this.currentUserId + "] 当前版本: " + WxLoginHook.this.versionName);
                         try {
                             JSONObject jSONObject = new JSONObject(WxLoginHook.this.jsonString).getJSONObject(WxLoginHook.this.versionName);
                             WxLoginHook.this.j1 = jSONObject.getString("j1");
@@ -647,9 +801,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                         try {
                             WxLoginHook.this.httpServer = new LoginHttpServer(WxLoginHook.this, WxLoginHook.this.httpPort, classLoader);
                             WxLoginHook.this.httpServer.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false);
-                            XposedBridge.log(TAG + " [" + WxLoginHook.this.currentPackageName + "] HTTP服务启动成功: http://设备IP:" + WxLoginHook.this.httpPort + "/login");
+                            XposedBridge.log(TAG + " [" + WxLoginHook.this.currentPackageName + " User:" + WxLoginHook.this.currentUserId + "] HTTP服务启动成功: http://设备IP:" + WxLoginHook.this.httpPort + "/login");
                             // 注册当前实例到共享文件，供其他实例发现
-                            WxLoginHook.this.registerInstance(WxLoginHook.this.currentPackageName, WxLoginHook.this.httpPort, WxLoginHook.this.versionName);
+                            WxLoginHook.this.registerInstance(WxLoginHook.this.currentPackageName, WxLoginHook.this.currentUserId, WxLoginHook.this.httpPort, WxLoginHook.this.versionName);
                             // 初始化执行模式配置
                             WxLoginHook.this.initConfig(context);
                         } catch (IOException e2) {
@@ -874,6 +1028,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 try {
                     JSONObject info = new JSONObject();
                     info.put("packageName", this.this$0.currentPackageName);
+                    info.put("userId", this.this$0.currentUserId);
                     info.put("port", this.this$0.httpPort);
                     info.put("version", this.this$0.versionName);
                     info.put("j1", this.this$0.j1);
@@ -890,11 +1045,22 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     JSONArray registry = this.this$0.readRegistry();
                     registry = this.this$0.cleanExpiredInstances(registry);
 
+                    // 构建端口映射表，方便查看
+                    JSONObject portMap = new JSONObject();
+                    for (int i = 0; i < registry.length(); i++) {
+                        JSONObject item = registry.getJSONObject(i);
+                        String key = item.getString("packageName") + "_User" + item.getInt("userId");
+                        portMap.put(key, item.getInt("port"));
+                    }
+
                     JSONObject result = new JSONObject();
                     result.put("instances", registry);
+                    result.put("portMap", portMap);  // 简化的端口映射表
                     result.put("current", this.this$0.currentPackageName);
+                    result.put("currentUserId", this.this$0.currentUserId);
                     result.put("currentPort", this.this$0.httpPort);
                     result.put("count", registry.length());
+                    result.put("registryFile", this.this$0.registryFilePath);  // 显示注册表文件路径
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", result.toString());
                 } catch (Exception e) {
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "application/json", "{\"err\":-500,\"msg\":\"" + e.getMessage() + "\"}");
@@ -1073,13 +1239,67 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     sb.append("  border-left: 4px solid #27ae60;");
                     sb.append("  margin: 15px 0;");
                     sb.append("}");
+                    sb.append(".instance-list {");
+                    sb.append("  margin-top: 15px;");
+                    sb.append("}");
+                    sb.append(".instance-item {");
+                    sb.append("  background: #f8f9fa;");
+                    sb.append("  padding: 10px 15px;");
+                    sb.append("  border-radius: 8px;");
+                    sb.append("  margin: 8px 0;");
+                    sb.append("  border-left: 4px solid #3498db;");
+                    sb.append("  display: flex;");
+                    sb.append("  justify-content: space-between;");
+                    sb.append("  align-items: center;");
+                    sb.append("}");
+                    sb.append(".instance-item.current {");
+                    sb.append("  border-left-color: #27ae60;");
+                    sb.append("  background: #e8f8f5;");
+                    sb.append("}");
+                    sb.append(".instance-item .port {");
+                    sb.append("  font-weight: bold;");
+                    sb.append("  color: #3498db;");
+                    sb.append("  font-size: 1.2em;");
+                    sb.append("}");
+                    sb.append(".instance-item.current .port {");
+                    sb.append("  color: #27ae60;");
+                    sb.append("}");
                     sb.append("</style>");
                     sb.append("</head>");
                     sb.append("<body>");
                     sb.append("<div class='container'>");
                     sb.append("<h1>📦 wxcode </h1>");
+
+                    // // 动态实例列表区域（通过 JavaScript 加载）
+                    // sb.append("<h2>📋 所有已启动实例</h2>");
+                    // sb.append("<div id='instance-list' class='instance-list'>");
+                    // sb.append("<p style='color:#666;'>正在加载实例列表...</p>");
+                    // sb.append("</div>");
+                    // sb.append("<script>");
+                    // sb.append("fetch('/instances').then(r => r.json()).then(data => {");
+                    // sb.append("  const list = document.getElementById('instance-list');");
+                    // sb.append("  if (data.count === 0) {");
+                    // sb.append("    list.innerHTML = '<p style=\"color:#e74c3c;\">⚠️ 注册表为空，可能原因：</p><ul><li>微信刚启动，尚未写入注册表</li><li>注册表文件不存在或无法访问</li></ul><p>请刷新页面重试，或检查日志。</p>';");
+                    // sb.append("    return;");
+                    // sb.append("  }");
+                    // sb.append("  let html = '<p>共检测到 <strong>' + data.count + '</strong> 个已启动的微信实例：</p>';");
+                    // sb.append("  data.instances.forEach(inst => {");
+                    // sb.append("    const isCurrent = inst.packageName === data.current && inst.userId === data.currentUserId;");
+                    // sb.append("    html += '<div class=\"instance-item' + (isCurrent ? ' current' : '') + '\">';");
+                    // sb.append("    html += '<span><code>' + inst.packageName + '</code> (User ' + inst.userId + ') | 版本 ' + inst.version + '</span>';");
+                    // sb.append("    html += '<span class=\"port\">端口 ' + inst.port + '</span>';");
+                    // sb.append("    html += '</div>';");
+                    // sb.append("  });");
+                    // sb.append("  html += '<p style=\"color:#666;font-size:0.85em;\">注册表文件: ' + (data.registryFile || '未知') + '</p>';");
+                    // sb.append("  list.innerHTML = html;");
+                    // sb.append("}).catch(e => {");
+                    // sb.append("  document.getElementById('instance-list').innerHTML = '<p style=\"color:#e74c3c;\">❌ 加载失败: ' + e + '</p><p>请检查 HTTP 服务是否正常运行。</p>';");
+                    // sb.append("});");
+                    // sb.append("</script>");
+
                     sb.append("<h2>📦 当前实例信息</h2>");
                     sb.append("<p><strong>包名：</strong> <code>").append(this.this$0.currentPackageName).append("</code></p>");
+                    sb.append("<p><strong>User ID：</strong> <code>").append(this.this$0.currentUserId).append("</code> <small style='color:#666;'>（用于区分系统级分身）</small></p>");
                     sb.append("<p><strong>HTTP端口：</strong> <code>").append(this.this$0.httpPort).append("</code></p>");
                     sb.append("<p><strong>微信版本：</strong> <code>").append(this.this$0.versionName).append("</code></p>");
 
@@ -1112,18 +1332,20 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     sb.append("<tr><td><code>/login</code></td><td>执行登录获取code</td><td><a href='/login?appId=wxaa3a999db5d744c6'>点击测试</a></td></tr>");
                     sb.append("</tbody></table>");
                     sb.append("<h2>💡 分身端口映射</h2>");
+                    sb.append("<p>端口计算公式：<code>基础端口(8088) + User ID偏移 + 包名后缀偏移</code></p>");
                     sb.append("<table>");
-                    sb.append("<thead><tr><th>包名</th><th>端口</th></tr></thead>");
+                    sb.append("<thead><tr><th>类型</th><th>标识</th><th>端口</th></tr></thead>");
                     sb.append("<tbody>");
-                    sb.append("<tr><td><code>com.tencent.mm</code></td><td>8088</td></tr>");
-                    sb.append("<tr><td><code>com.tencent.mm:dual</code></td><td>8089</td></tr>");
-                    sb.append("<tr><td><code>com.tencent.mm:clone</code></td><td>8090</td></tr>");
-                    sb.append("<tr><td><code>com.tencent.mm_1</code></td><td>8091</td></tr>");
-                    sb.append("<tr><td><code>com.tencent.mm_2</code></td><td>8092</td></tr>");
-                    sb.append("<tr><td><code>com.tencent.mm_xiaomi</code></td><td>8093</td></tr>");
-                    sb.append("<tr><td><code>其他分身</code></td><td>8096-8995(动态计算)</td></tr>");
+                    sb.append("<tr><td>主用户微信</td><td><code>com.tencent.mm (User 0)</code></td><td>8088</td></tr>");
+                    sb.append("<tr><td>系统分身</td><td><code>com.tencent.mm (User 999)</code></td><td>8199 (8088+999%100+100)</td></tr>");
+                    sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm:dual</code></td><td>8089</td></tr>");
+                    sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm:clone</code></td><td>8090</td></tr>");
+                    sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm_1</code></td><td>8091</td></tr>");
+                    sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm_2</code></td><td>8092</td></tr>");
+                    sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm_xiaomi</code></td><td>8093</td></tr>");
+                    sb.append("<tr><td>其他分身</td><td><code>动态计算</code></td><td>8096-9000</td></tr>");
                     sb.append("</tbody></table>");
-                    sb.append("<p>💡 提示：访问 <a href='/whoami'>/whoami</a> 可确认当前实例信息</p>");
+                    sb.append("<p>💡 提示：访问 <a href='/whoami'>/whoami</a> 可确认当前实例信息，访问 <a href='/instances'>/instances</a> 可查看所有实例</p>");
                     sb.append("<h2>📋 适配版本列表</h2>");
                     sb.append("<table>");
                     sb.append("<thead>");
