@@ -8,11 +8,10 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
-import android.os.Environment;
 import android.os.Build;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.app.ActivityManager;
@@ -27,7 +26,10 @@ import fi.iki.elonen.NanoHTTPD;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.RandomAccessFile;
+import java.nio.channels.FileLock;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.LocalDateTime;
@@ -36,38 +38,37 @@ import java.util.LinkedList;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-/* JADX INFO: loaded from: classes.dex */
 public class WxLoginHook implements IXposedHookLoadPackage {
     private static final long CALLBACK_TIMEOUT_MS = 15000;
     private static final String DEFAULT_AUTO_APP_ID = "wxaa3a999db5d744c6";
     private static final String TAG = "xiaojw-wxcode";
     private static final String WECHAT_PACKAGE_PREFIX = "com.tencent.mm";
 
-    // 注册表文件路径（使用外部存储，普通应用可写入）
-    // 方案1: 外部存储公共目录（需要存储权限，但大多数设备已授权）
-    // 方案2: 如果外部存储不可用，回退到应用私有目录（但无法跨进程共享）
+    // 全局共享注册表路径 ROOT跨多用户专用
+    private static final String GLOBAL_REGISTRY_DIR = "/data/misc/wxcode/";
+    private static final String GLOBAL_REGISTRY_NAME = "registry.json";
     private String registryFilePath = null;
 
     // 执行模式常量
-    private static final String MODE_FOREGROUND_SERVICE = "foreground_service";  // 前台服务保活
-    private static final String MODE_WORKER_THREAD = "worker_thread";            // 子线程轮询
-    private static final String MODE_TEMP_WAKEUP = "temp_wakeup";                // 临时唤醒
+    private static final String MODE_FOREGROUND_SERVICE = "foreground_service";
+    private static final String MODE_WORKER_THREAD = "worker_thread";
+    private static final String MODE_TEMP_WAKEUP = "temp_wakeup";
 
     private LoginHttpServer httpServer;
     private boolean isLoginInFlight = false;
     private Context appContext;
     private SharedPreferences prefs;
-    private String currentMode = MODE_WORKER_THREAD;  // 默认使用子线程模式
+    private String currentMode = MODE_WORKER_THREAD;
     private HandlerThread workerThread;
     private Handler workerHandler;
     private boolean isForegroundServiceRunning = false;
-    private PowerManager.WakeLock wakeLock;  // WakeLock 保持 CPU 运行
-    private Application wechatApplication;   // 微信 Application 实例
-    private Activity fakeTopActivity;        // 用于伪造前台的 Activity 引用
-    private ClassLoader savedClassLoader;    // 保存 ClassLoader 用于恢复状态
-    private boolean wasForegroundBeforeLogin = false;  // 记录登录前的前台状态
+    private PowerManager.WakeLock wakeLock;
+    private Application wechatApplication;
+    private Activity fakeTopActivity;
+    private ClassLoader savedClassLoader;
+    private boolean wasForegroundBeforeLogin = false;
 
-    // 版本配置JSON字符串（使用文本块，无需转义双引号）
+    // 版本配置JSON
     private String jsonString = """
         {
             "8.0.49": {"j1": "u70.k1", "c": "o60.c"},
@@ -82,155 +83,133 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private String c = "he0.c";
     private String versionName = "000";
     private String currentPackageName = "";
-    private int currentUserId = 0;  // 当前实例的 User ID（用于区分系统级分身）
+    private int currentUserId = 0;
     private int httpPort = 8088;
 
     /**
-     * 检查是否为微信或微信分身包名
-     * 支持的格式:
-     * - com.tencent.mm (原始微信)
-     * - com.tencent.mm:dual (某些厂商分身)
-     * - com.tencent.mm_xxxxx (小米等厂商分身)
-     * - com.tencent.mm.clone (克隆应用)
-     * - com.tencent.mm.xxx (其他变体)
+     * 判断是否微信/微信分身包名
      */
     private boolean isWeChatPackage(String packageName) {
         if (packageName == null) return false;
-        // 精确匹配原始微信
         if (packageName.equals("com.tencent.mm")) return true;
-        // 匹配分身格式: com.tencent.mm:dual, com.tencent.mm_xxx, com.tencent.mm.xxx
         if (packageName.startsWith("com.tencent.mm:")) return true;
         if (packageName.startsWith("com.tencent.mm_")) return true;
         if (packageName.startsWith("com.tencent.mm.")) return true;
-        // 匹配其他可能的分身格式
         if (packageName.contains("tencent.mm") && packageName.length() > "com.tencent.mm".length()) return true;
         return false;
     }
 
     /**
-     * 初始化注册表文件路径
-     * 优先使用外部存储公共目录，确保不同进程可以共享
+     * 初始化全局共享注册表路径，ROOT自动赋777权限
      */
     private void initRegistryFilePath() {
-        // 优先方案：外部存储公共目录（Android 10+ 需要特殊处理）
+        File globalDir = new File(GLOBAL_REGISTRY_DIR);
+        registryFilePath = GLOBAL_REGISTRY_DIR + GLOBAL_REGISTRY_NAME;
+        File regFile = new File(registryFilePath);
+
+        try {
+            if (!globalDir.exists()) {
+                globalDir.mkdirs();
+                XposedBridge.log(TAG + " 创建全局共享目录: " + globalDir.getAbsolutePath());
+            }
+            // ROOT授权全用户读写
+            Runtime.getRuntime().exec("chmod 777 " + GLOBAL_REGISTRY_DIR);
+            Runtime.getRuntime().exec("chmod 777 " + registryFilePath);
+            // 文件权限全局可读可写
+            globalDir.setReadable(true, false);
+            globalDir.setWritable(true, false);
+            globalDir.setExecutable(true, false);
+            regFile.setReadable(true, false);
+            regFile.setWritable(true, false);
+            XposedBridge.log(TAG + " [" + currentPackageName + " User:" + currentUserId + "] 全局共享注册表路径: " + registryFilePath);
+        } catch (Exception e) {
+            XposedBridge.log(TAG + " 全局目录授权失败，设备未ROOT，降级本地存储: " + e.getMessage());
+            fallbackLocalRegistryPath();
+        }
+    }
+
+    /**
+     * 无ROOT降级方案：仅当前用户分身互通
+     */
+    private void fallbackLocalRegistryPath() {
         try {
             File externalDir = Environment.getExternalStorageDirectory();
             if (externalDir != null && externalDir.canWrite()) {
                 registryFilePath = externalDir.getAbsolutePath() + "/wxcode_registry.json";
-                XposedBridge.log(TAG + " [" + currentPackageName + "] 使用外部存储注册表: " + registryFilePath);
+                XposedBridge.log(TAG + " 降级外部存储注册表: " + registryFilePath);
                 return;
             }
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 外部存储不可用: " + e.getMessage());
-        }
-
-        // 方案2：应用私有外部存储目录（Android 10+ 推荐，无需权限）
+        } catch (Exception ignored) {}
         try {
             if (appContext != null) {
                 File appExternalDir = appContext.getExternalFilesDir(null);
                 if (appExternalDir != null) {
-                    // 使用固定路径名，不同应用都能访问（需要同一包名）
-                    // 由于分身包名相同，这里的路径实际上指向不同用户的数据目录
                     registryFilePath = appExternalDir.getAbsolutePath() + "/wxcode_registry.json";
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] 使用应用外部存储注册表: " + registryFilePath);
+                    XposedBridge.log(TAG + " 降级应用私有外部存储: " + registryFilePath);
                     return;
                 }
             }
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 应用外部存储不可用: " + e.getMessage());
-        }
-
-        // 方案3：尝试使用 /data/local/tmp（可能需要 root 提前创建并 chmod 777）
+        } catch (Exception ignored) {}
         registryFilePath = "/data/local/tmp/wxcode_registry.json";
-        XposedBridge.log(TAG + " [" + currentPackageName + "] 回退使用 /data/local/tmp（可能需要 root 权限）: " + registryFilePath);
+        XposedBridge.log(TAG + " 降级 /data/local/tmp 注册表: " + registryFilePath);
     }
 
     /**
-     * 获取当前进程的 User ID
-     * 用于区分系统级分身（同一包名，不同用户空间）
-     *
-     * Android 多用户机制:
-     * - 主用户: User ID = 0
-     * - 工作资料: User ID = 10, 11, ...
-     * - 系统分身: User ID 通常是 999, 888 等特殊值
+     * 获取当前进程UserID，区分多用户/系统分身
      */
     private int getUserId() {
         try {
-            // 方法1: 通过 UserHandle.myUserId() 反射调用（Android @hide API）
             Method myUserIdMethod = UserHandle.class.getDeclaredMethod("myUserId");
             myUserIdMethod.setAccessible(true);
             int userId = (int) myUserIdMethod.invoke(null);
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 通过 UserHandle.myUserId() 获取 User ID: " + userId);
+            XposedBridge.log(TAG + " [" + currentPackageName + "] UserHandle.myUserId 获取UID: " + userId);
             return userId;
         } catch (Exception e1) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] UserHandle.myUserId() 失败: " + e1.getMessage());
+            XposedBridge.log(TAG + " UserHandle.myUserId 失败: " + e1.getMessage());
         }
-
         try {
-            // 方法2: 通过 Process.myUserHandle() 获取 UserHandle，然后反射获取 userId
             UserHandle userHandle = android.os.Process.myUserHandle();
             if (userHandle != null) {
                 Field userIdField = UserHandle.class.getDeclaredField("mHandle");
                 userIdField.setAccessible(true);
                 int userId = userIdField.getInt(userHandle);
-                XposedBridge.log(TAG + " [" + currentPackageName + "] 通过 Process.myUserHandle() 获取 User ID: " + userId);
+                XposedBridge.log(TAG + " Process.myUserHandle 获取UID: " + userId);
                 return userId;
             }
         } catch (Exception e2) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] Process.myUserHandle() 失败: " + e2.getMessage());
+            XposedBridge.log(TAG + " Process.myUserHandle 失败: " + e2.getMessage());
         }
-
         try {
-            // 方法3: 通过数据目录路径解析 /data/user/{userId}/com.tencent.mm
             String dataDir = appContext.getDataDir() != null ? appContext.getDataDir().getAbsolutePath() : null;
             if (dataDir != null && dataDir.contains("/data/user/")) {
-                // 路径格式: /data/user/{userId}/com.tencent.mm
                 String[] parts = dataDir.split("/");
                 if (parts.length >= 4 && "data".equals(parts[1]) && "user".equals(parts[2])) {
                     int userId = Integer.parseInt(parts[3]);
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] 通过数据目录获取 User ID: " + userId);
+                    XposedBridge.log(TAG + " 数据目录解析UID: " + userId);
                     return userId;
                 }
             }
         } catch (Exception e3) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 数据目录解析失败: " + e3.getMessage());
+            XposedBridge.log(TAG + " 目录解析UID失败: " + e3.getMessage());
         }
-
-        // 默认返回 0（主用户）
-        XposedBridge.log(TAG + " [" + currentPackageName + "] 无法获取 User ID，默认使用 0（主用户）");
+        XposedBridge.log(TAG + " 无法获取UID，默认0");
         return 0;
     }
 
     /**
-     * 根据包名和 User ID 计算HTTP端口，确保不同分身使用不同端口
-     * 端口分配策略:
-     * - 系统级分身（同一包名，不同 User ID）: 基于 User ID 偏移
-     * - 包名后缀分身（如 :dual, _1）: 固定端口映射
-     * - 其他格式: 动态计算
-     *
-     * 端口计算公式: 基础端口 + User ID 偏移 + 包名后缀偏移
+     * 根据包名+UserID计算唯一端口，避免冲突
      */
     private int calculatePort(String packageName, int userId) {
-        int basePort = 8088;  // 原始微信的基础端口
-
-        // 系统级分身（同一包名，不同 User ID）: 每个用户增加 1 端口偏移
-        // User ID 0 → 8088, User ID 999 → 8088+999=9087（超过范围需要处理）
+        int basePort = 8088;
         if (userId > 0) {
-            // 为避免端口冲突，使用更合理的偏移策略
-            // User ID 10-99: 基础端口 + userId (8088+10=8098)
-            // User ID >= 100: 使用哈希映射到安全范围
             if (userId < 100) {
                 basePort = basePort + userId;
             } else {
-                // 大 User ID（如系统分身 999）使用哈希映射到 8100-8200 范围
-                basePort = 8100 + (userId % 100);
+                basePort = 8200 + (userId % 100);
             }
-            XposedBridge.log(TAG + " [" + packageName + "] User ID " + userId + " 端口偏移: " + basePort);
+            XposedBridge.log(TAG + " [" + packageName + "] UID端口偏移: " + basePort);
         }
-
-        // 如果不是原始包名，再叠加包名后缀的额外偏移
         if (!packageName.equals("com.tencent.mm")) {
-            // 常见分身后缀的固定额外偏移（叠加到 User ID 基础上）
             if (packageName.endsWith(":dual")) return basePort + 1;
             if (packageName.endsWith(":clone")) return basePort + 2;
             if (packageName.endsWith("_1")) return basePort + 3;
@@ -238,48 +217,37 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             if (packageName.endsWith("_xiaomi")) return basePort + 5;
             if (packageName.endsWith(".dual")) return basePort + 6;
             if (packageName.endsWith(".clone")) return basePort + 7;
-
-            // 其他格式：使用包名哈希计算额外偏移
             int sum = 0;
             for (int i = "com.tencent.mm".length(); i < packageName.length(); i++) {
                 sum += packageName.charAt(i);
             }
-            // 叠加偏移范围: 8-107（避免与上面固定映射冲突）
             int extraOffset = 8 + (sum % 100);
             int port = basePort + extraOffset;
-
-            // 确保端口不超过合理范围（最大 9000）
             if (port > 9000) {
                 port = 8096 + ((port - 8096) % 900);
             }
-
-            XposedBridge.log(TAG + " [" + packageName + "] 包名后缀偏移: " + extraOffset + ", 最终端口: " + port);
+            XposedBridge.log(TAG + " [" + packageName + "] 后缀偏移:" + extraOffset + " 最终端口:" + port);
             return port;
         }
-
-        XposedBridge.log(TAG + " [" + packageName + "] 计算端口: " + basePort + " (User ID: " + userId + ")");
+        XposedBridge.log(TAG + " [" + packageName + "] 端口:" + basePort + " UID:" + userId);
         return basePort;
     }
 
     /**
-     * 注册当前实例到共享文件
-     * 所有微信实例启动时都会写入自己的信息，实现跨进程发现
+     * 注册当前分身实例到全局共享注册表
      */
     private void registerInstance(String packageName, int userId, int port, String version) {
         try {
             JSONArray registry = readRegistry();
-
-            // 移除旧记录（如果已存在，同时匹配 packageName 和 userId）
+            registry = cleanExpiredInstances(registry);
+            // 移除同包同UID旧记录
             for (int i = 0; i < registry.length(); i++) {
                 JSONObject item = registry.getJSONObject(i);
-                if (item.getString("packageName").equals(packageName) &&
-                    item.getInt("userId") == userId) {
+                if (item.getString("packageName").equals(packageName) && item.getInt("userId") == userId) {
                     registry.remove(i);
                     break;
                 }
             }
-
-            // 添加新记录
             JSONObject instance = new JSONObject();
             instance.put("packageName", packageName);
             instance.put("userId", userId);
@@ -287,68 +255,73 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             instance.put("version", version);
             instance.put("registerTime", System.currentTimeMillis());
             registry.put(instance);
-
-            // 写入文件
             writeRegistry(registry);
-            XposedBridge.log(TAG + " 实例已注册: " + packageName + " (User " + userId + ") :" + port);
+            XposedBridge.log(TAG + " 全局注册表注册实例: " + packageName + " UID" + userId + " :" + port);
         } catch (Exception e) {
             XposedBridge.log(TAG + " 注册实例失败: " + e.getMessage());
         }
     }
 
     /**
-     * 从共享文件读取所有已注册的实例
+     * 带共享读锁读取注册表，防止并发损坏JSON
      */
     private JSONArray readRegistry() {
+        if (registryFilePath == null) initRegistryFilePath();
+        File file = new File(registryFilePath);
+        if (!file.exists()) return new JSONArray();
+        RandomAccessFile raf = null;
+        FileLock lock = null;
+        JSONArray result = new JSONArray();
         try {
-            if (registryFilePath == null) {
-                initRegistryFilePath();
-            }
-            File file = new File(registryFilePath);
-            if (!file.exists()) {
-                XposedBridge.log(TAG + " [" + currentPackageName + "] 注册表文件不存在: " + registryFilePath);
-                return new JSONArray();
-            }
-            FileInputStream fis = new FileInputStream(file);
-            byte[] data = new byte[fis.available()];
-            fis.read(data);
-            fis.close();
-            return new JSONArray(new String(data, "UTF-8"));
+            raf = new RandomAccessFile(file, "r");
+            lock = raf.getChannel().lock(0, Long.MAX_VALUE, true);
+            byte[] data = new byte[(int) raf.length()];
+            raf.readFully(data);
+            result = new JSONArray(new String(data, "UTF-8"));
         } catch (Exception e) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 读取注册表失败: " + e.getMessage());
-            return new JSONArray();
+            XposedBridge.log(TAG + " 读取注册表异常: " + e.getMessage());
+        } finally {
+            try {
+                if (lock != null) lock.release();
+                if (raf != null) raf.close();
+            } catch (Exception ignored) {}
         }
+        return result;
     }
 
     /**
-     * 写入注册表到共享文件
+     * 独占写锁写入注册表，多进程串行写入
      */
     private void writeRegistry(JSONArray registry) {
+        if (registryFilePath == null) initRegistryFilePath();
+        File file = new File(registryFilePath);
+        File parentDir = file.getParentFile();
+        if (parentDir != null && !parentDir.exists()) parentDir.mkdirs();
+        RandomAccessFile raf = null;
+        FileLock lock = null;
         try {
-            if (registryFilePath == null) {
-                initRegistryFilePath();
-            }
-            File file = new File(registryFilePath);
-            // 如果父目录不存在，创建目录
-            File parentDir = file.getParentFile();
-            if (parentDir != null && !parentDir.exists()) {
-                parentDir.mkdirs();
-                XposedBridge.log(TAG + " [" + currentPackageName + "] 创建目录: " + parentDir.getAbsolutePath());
-            }
-            FileOutputStream fos = new FileOutputStream(file);
-            fos.write(registry.toString().getBytes("UTF-8"));
-            fos.close();
-            // 设置文件权限为可读写（所有进程都能访问）
+            raf = new RandomAccessFile(file, "rw");
+            lock = raf.getChannel().lock();
+            raf.setLength(0);
+            byte[] content = registry.toString().getBytes("UTF-8");
+            raf.write(content);
+            // 重新授权全局权限
+            Runtime.getRuntime().exec("chmod 777 " + registryFilePath);
             file.setReadable(true, false);
             file.setWritable(true, false);
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 注册表写入成功: " + registryFilePath);
+            XposedBridge.log(TAG + " 全局注册表写入成功");
         } catch (Exception e) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 写入注册表失败: " + e.getMessage() + " | 路径: " + registryFilePath);
+            XposedBridge.log(TAG + " 写入注册表失败: " + e.getMessage() + " path:" + registryFilePath);
+        } finally {
+            try {
+                if (lock != null) lock.release();
+                if (raf != null) raf.close();
+            } catch (Exception ignored) {}
         }
     }
 
     /**
-     * 清理过期的实例记录（超过5分钟未更新的视为已关闭）
+     * 清理5分钟过期实例记录
      */
     private JSONArray cleanExpiredInstances(JSONArray registry) {
         long now = System.currentTimeMillis();
@@ -357,7 +330,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             for (int i = 0; i < registry.length(); i++) {
                 JSONObject item = registry.getJSONObject(i);
                 long registerTime = item.getLong("registerTime");
-                // 保留最近5分钟内注册的实例
                 if (now - registerTime < 300000) {
                     cleaned.put(item);
                 }
@@ -369,26 +341,20 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 初始化配置
+     * 初始化全局配置、生命周期、执行模式
      */
     private void initConfig(Context context) {
         this.appContext = context;
-        if (context instanceof Application) {
-            this.wechatApplication = (Application) context;
-        }
+        if (context instanceof Application) this.wechatApplication = (Application) context;
         this.prefs = context.getSharedPreferences("wxcode_config", Context.MODE_PRIVATE);
         this.currentMode = prefs.getString("exec_mode", MODE_WORKER_THREAD);
         XposedBridge.log(TAG + " [" + currentPackageName + "] 当前执行模式: " + currentMode);
-
-        // Hook Activity 生命周期，记录当前 Activity
         hookActivityLifecycle();
-
-        // 根据配置启动相应的服务
         applyExecutionMode();
     }
 
     /**
-     * Hook 微信 Activity 生命周期，记录顶部 Activity
+     * 监听微信Activity生命周期，记录前台页面
      */
     private void hookActivityLifecycle() {
         if (wechatApplication == null) return;
@@ -396,177 +362,112 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             Application.ActivityLifecycleCallbacks callback = new Application.ActivityLifecycleCallbacks() {
                 @Override
                 public void onActivityCreated(Activity activity, android.os.Bundle savedInstanceState) {}
-
                 @Override
                 public void onActivityStarted(Activity activity) {}
-
                 @Override
                 public void onActivityResumed(Activity activity) {
                     fakeTopActivity = activity;
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] Activity Resumed: " + activity.getClass().getSimpleName());
+                    XposedBridge.log(TAG + " [" + currentPackageName + "] 前台Activity: " + activity.getClass().getSimpleName());
                 }
-
                 @Override
-                public void onActivityPaused(Activity activity) {
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] Activity Paused: " + activity.getClass().getSimpleName());
-                }
-
+                public void onActivityPaused(Activity activity) {}
                 @Override
                 public void onActivityStopped(Activity activity) {}
-
                 @Override
                 public void onActivitySaveInstanceState(Activity activity, android.os.Bundle outState) {}
-
                 @Override
                 public void onActivityDestroyed(Activity activity) {
-                    if (fakeTopActivity == activity) {
-                        fakeTopActivity = null;
-                    }
+                    if (fakeTopActivity == activity) fakeTopActivity = null;
                 }
             };
             wechatApplication.registerActivityLifecycleCallbacks(callback);
-            XposedBridge.log(TAG + " [" + currentPackageName + "] Activity 生命周期 Hook 已注册");
+            XposedBridge.log(TAG + " Activity生命周期Hook注册完成");
         } catch (Exception e) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 注册 ActivityLifecycleCallbacks 失败: " + e.getMessage());
+            XposedBridge.log(TAG + " 注册生命周期回调失败: " + e.getMessage());
         }
     }
 
     /**
-     * 强制伪造前台状态（通过反射设置微信内部状态）
-     * 尝试多种方式让微信认为自己在前台
-     * 注意：会保存原始状态，登录完成后需要调用 restoreForegroundState 恢复
+     * 强制伪造微信前台状态，保存原始状态
      */
     private void forceForegroundState(ClassLoader classLoader) {
-        XposedBridge.log(TAG + " [" + currentPackageName + "] 尝试伪造前台状态...");
+        XposedBridge.log(TAG + " [" + currentPackageName + "] 伪造前台状态");
         savedClassLoader = classLoader;
-
-        // 方法1：尝试 Hook 微信的 ForegroundDetector（常见的前台检测类）
         try {
             Class<?> foregroundClass = XposedHelpers.findClassIfExists("com.tencent.mm.sdk.platformtools.ForegroundDetector", classLoader);
             if (foregroundClass != null) {
-                // 先保存原始状态
+                Field isForegroundField = foregroundClass.getDeclaredField("isForeground");
+                isForegroundField.setAccessible(true);
+                wasForegroundBeforeLogin = isForegroundField.getBoolean(null);
+                isForegroundField.set(null, true);
                 try {
-                    Field isForegroundField = foregroundClass.getDeclaredField("isForeground");
-                    isForegroundField.setAccessible(true);
-                    wasForegroundBeforeLogin = isForegroundField.getBoolean(null);
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] 原始前台状态: " + wasForegroundBeforeLogin);
-
-                    // 设置为前台
-                    isForegroundField.set(null, true);
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] ForegroundDetector.isForeground 已设置为 true");
-                } catch (Exception e) {
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] 设置 ForegroundDetector 字段失败: " + e.getMessage());
-                }
-
-                // 尝试设置 foreground 字段为 true（可能是这个名字）
-                try {
-                    Field foregroundField = foregroundClass.getDeclaredField("foreground");
-                    foregroundField.setAccessible(true);
-                    foregroundField.set(null, true);
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] ForegroundDetector.foreground 已设置为 true");
+                    Field fgField = foregroundClass.getDeclaredField("foreground");
+                    fgField.setAccessible(true);
+                    fgField.set(null, true);
                 } catch (Exception ignored) {}
             }
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] ForegroundDetector 类不存在或访问失败");
-        }
-
-        // 方法2：尝试 Hook 微信的 MMAppForegroundMonitor
+        } catch (Exception ignored) {}
         try {
             Class<?> monitorClass = XposedHelpers.findClassIfExists("com.tencent.mm.sdk.platformtools.MMAppForegroundMonitor", classLoader);
             if (monitorClass != null) {
                 Field[] fields = monitorClass.getDeclaredFields();
                 for (Field field : fields) {
-                    if (field.getName().contains("foreground") || field.getName().contains("isForeground")) {
-                        try {
-                            field.setAccessible(true);
-                            field.set(null, true);
-                            XposedBridge.log(TAG + " [" + currentPackageName + "] MMAppForegroundMonitor." + field.getName() + " 已设置为 true");
-                        } catch (Exception ignored) {}
+                    if (field.getName().contains("foreground")) {
+                        field.setAccessible(true);
+                        field.set(null, true);
                     }
                 }
             }
         } catch (Exception ignored) {}
-
-        XposedBridge.log(TAG + " [" + currentPackageName + "] 前台状态伪造完成");
     }
 
     /**
-     * 恢复原始前台状态
-     * 在登录完成后调用，避免微信持续认为自己在前台导致额外耗电
+     * 登录完成恢复原始前台状态
      */
     private void restoreForegroundState() {
         if (savedClassLoader == null) return;
-
-        XposedBridge.log(TAG + " [" + currentPackageName + "] 恢复原始前台状态...");
-
-        // 恢复 ForegroundDetector 的原始状态
+        XposedBridge.log(TAG + " 恢复原始前台状态");
         try {
             Class<?> foregroundClass = XposedHelpers.findClassIfExists("com.tencent.mm.sdk.platformtools.ForegroundDetector", savedClassLoader);
             if (foregroundClass != null) {
-                try {
-                    Field isForegroundField = foregroundClass.getDeclaredField("isForeground");
-                    isForegroundField.setAccessible(true);
-                    isForegroundField.set(null, wasForegroundBeforeLogin);
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] ForegroundDetector.isForeground 已恢复为 " + wasForegroundBeforeLogin);
-                } catch (Exception ignored) {}
+                Field isForegroundField = foregroundClass.getDeclaredField("isForeground");
+                isForegroundField.setAccessible(true);
+                isForegroundField.set(null, wasForegroundBeforeLogin);
             }
         } catch (Exception ignored) {}
-
         savedClassLoader = null;
-        XposedBridge.log(TAG + " [" + currentPackageName + "] 前台状态恢复完成");
     }
 
     /**
-     * 检查微信是否在前台运行
-     * @return true 如果微信有可见的 Activity
+     * 判断微信当前是否前台运行
      */
     private boolean isWeChatForeground() {
-        // 方法1：检查 fakeTopActivity（通过 ActivityLifecycleCallbacks 记录）
-        if (fakeTopActivity != null && !fakeTopActivity.isFinishing()) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 微信在前台（通过 ActivityLifecycleCallbacks）");
-            return true;
-        }
-
-        // 方法2：检查进程重要性
+        if (fakeTopActivity != null && !fakeTopActivity.isFinishing()) return true;
         try {
             ActivityManager am = (ActivityManager) appContext.getSystemService(Context.ACTIVITY_SERVICE);
             for (ActivityManager.RunningAppProcessInfo process : am.getRunningAppProcesses()) {
                 if (process.processName.equals(currentPackageName)) {
-                    // IMPORTANCE_FOREGROUND = 100, IMPORTANCE_VISIBLE = 200
-                    boolean isForeground = process.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE;
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] 进程重要性: " + process.importance + ", 是否前台: " + isForeground);
-                    return isForeground;
+                    return process.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE;
                 }
             }
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 检查进程重要性失败: " + e.getMessage());
-        }
-
-        // 方法3：检查是否有 Activity 在运行（通过 ActivityManager.getRunningTasks）
-        try {
-            ActivityManager am = (ActivityManager) appContext.getSystemService(Context.ACTIVITY_SERVICE);
-            // Android 5.0+ 只能获取自己应用的任务信息
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+        } catch (Exception ignored) {}
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+            try {
+                ActivityManager am = (ActivityManager) appContext.getSystemService(Context.ACTIVITY_SERVICE);
                 java.util.List<ActivityManager.RunningTaskInfo> tasks = am.getRunningTasks(1);
-                if (tasks != null && !tasks.isEmpty()) {
+                if (!tasks.isEmpty()) {
                     ActivityManager.RunningTaskInfo topTask = tasks.get(0);
-                    if (topTask.topActivity != null &&
-                        topTask.topActivity.getPackageName().equals(currentPackageName)) {
-                        XposedBridge.log(TAG + " [" + currentPackageName + "] 微信在前台（通过 RunningTasks）");
+                    if (topTask.topActivity != null && topTask.topActivity.getPackageName().equals(currentPackageName)) {
                         return true;
                     }
                 }
-            }
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 检查 RunningTasks 失败: " + e.getMessage());
+            } catch (Exception ignored) {}
         }
-
-        XposedBridge.log(TAG + " [" + currentPackageName + "] 微信不在前台");
         return false;
     }
 
     /**
-     * 应用当前执行模式
+     * 根据配置启动对应保活模式
      */
     private void applyExecutionMode() {
         switch (currentMode) {
@@ -577,8 +478,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 startWorkerThread();
                 break;
             case MODE_TEMP_WAKEUP:
-                // 临时唤醒模式不需要预先启动服务
-                XposedBridge.log(TAG + " [" + currentPackageName + "] 使用临时唤醒模式");
+                XposedBridge.log(TAG + " 使用临时唤醒模式");
                 break;
             default:
                 startWorkerThread();
@@ -587,104 +487,52 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 启动前台服务保活
-     * 在 Xposed 环境中无法直接启动 Service，使用 WakeLock + 通知 + 进程优先级提升
+     * 前台保活模式：WakeLock+常驻通知提升进程优先级
      */
     private void startForegroundService() {
-        if (isForegroundServiceRunning) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 前台服务已运行");
-            return;
-        }
+        if (isForegroundServiceRunning) return;
         try {
-            // 1. 获取 WakeLock，保持 CPU 运行
             PowerManager pm = (PowerManager) appContext.getSystemService(Context.POWER_SERVICE);
-            wakeLock = pm.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "wxcode:wakelock_" + currentPackageName
-            );
-            wakeLock.acquire(10 * 60 * 1000L); // 最多持有10分钟，防止永久占用
-            XposedBridge.log(TAG + " [" + currentPackageName + "] WakeLock 已获取");
-
-            // 2. 创建通知渠道和通知
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wxcode:wakelock_" + currentPackageName);
+            wakeLock.acquire(10 * 60 * 1000L);
             String channelId = "wxcode_service_" + currentPackageName;
             NotificationManager nm = (NotificationManager) appContext.getSystemService(Context.NOTIFICATION_SERVICE);
-
-            // Android 8.0+ 需要创建通知渠道
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                NotificationChannel channel = new NotificationChannel(
-                    channelId,
-                    "wxcode 后台服务",
-                    NotificationManager.IMPORTANCE_LOW  // 低重要性，但比 MIN 更稳定
-                );
-                channel.setDescription("保持 wxcode HTTP 服务在后台运行");
+                NotificationChannel channel = new NotificationChannel(channelId, "wxcode后台服务", NotificationManager.IMPORTANCE_LOW);
+                channel.setDescription("wxcode HTTP服务保活");
                 channel.setShowBadge(false);
                 nm.createNotificationChannel(channel);
             }
-
-            // 创建通知
             Notification.Builder builder = new Notification.Builder(appContext)
-                .setContentTitle("wxcode 服务运行中")
-                .setContentText(currentPackageName + " | 点击查看状态")
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setPriority(Notification.PRIORITY_LOW)
-                .setOngoing(true);
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                builder.setChannelId(channelId);
-            }
-
-            Notification notification = builder.build();
-            nm.notify(httpPort, notification);  // 显示通知，提升进程可见性
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 通知已显示");
-
-            // 3. 尝试提升进程优先级（通过 ActivityManager）
-            try {
-                ActivityManager am = (ActivityManager) appContext.getSystemService(Context.ACTIVITY_SERVICE);
-                for (ActivityManager.RunningAppProcessInfo process : am.getRunningAppProcesses()) {
-                    if (process.processName.equals(currentPackageName)) {
-                        // 设置为重要进程（IMPORTANCE_FOREGROUND_SERVICE 级别）
-                        XposedBridge.log(TAG + " [" + currentPackageName + "] 当前进程重要性: " + process.importance);
-                        break;
-                    }
-                }
-            } catch (Exception e) {
-                XposedBridge.log(TAG + " [" + currentPackageName + "] 获取进程信息失败: " + e.getMessage());
-            }
-
+                    .setContentTitle("wxcode 服务运行中")
+                    .setContentText(currentPackageName + " HTTP端口:" + httpPort)
+                    .setSmallIcon(android.R.drawable.ic_dialog_info)
+                    .setPriority(Notification.PRIORITY_LOW)
+                    .setOngoing(true);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) builder.setChannelId(channelId);
+            nm.notify(httpPort, builder.build());
             isForegroundServiceRunning = true;
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 前台服务保活模式已激活");
-
+            XposedBridge.log(TAG + " 前台保活模式已启动");
         } catch (Exception e) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 启动前台服务失败: " + e.getMessage());
-            // 释放 WakeLock
-            if (wakeLock != null && wakeLock.isHeld()) {
-                wakeLock.release();
-            }
-            // 失败时回退到子线程模式
+            XposedBridge.log(TAG + " 前台服务启动失败:" + e.getMessage());
+            if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
             startWorkerThread();
         }
     }
 
     /**
-     * 启动子线程用于轮询
+     * 启动后台轮询子线程
      */
     private void startWorkerThread() {
-        if (workerThread != null && workerThread.isAlive()) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 工作线程已运行");
-            return;
-        }
-        try {
-            workerThread = new HandlerThread("wxcode_worker_" + httpPort);
-            workerThread.start();
-            workerHandler = new Handler(workerThread.getLooper());
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 工作线程已启动");
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 启动工作线程失败: " + e.getMessage());
-        }
+        if (workerThread != null && workerThread.isAlive()) return;
+        workerThread = new HandlerThread("wxcode_worker_" + httpPort);
+        workerThread.start();
+        workerHandler = new Handler(workerThread.getLooper());
+        XposedBridge.log(TAG + " 工作线程启动成功");
     }
 
     /**
-     * 停止工作线程
+     * 安全停止工作线程
      */
     private void stopWorkerThread() {
         if (workerThread != null) {
@@ -695,7 +543,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 临时唤醒微信到前台
+     * 拉起微信到前台
      */
     private void tempWakeupWeChat() {
         try {
@@ -703,319 +551,246 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             if (intent != null) {
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                 appContext.startActivity(intent);
-                XposedBridge.log(TAG + " [" + currentPackageName + "] 已临时唤醒微信");
-                // 等待微信启动
                 Thread.sleep(500);
             }
         } catch (Exception e) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 临时唤醒失败: " + e.getMessage());
+            XposedBridge.log(TAG + " 唤醒微信失败:" + e.getMessage());
         }
     }
 
     /**
-     * 更新执行模式配置
+     * 切换执行模式并持久化配置
      */
     private void updateExecutionMode(String newMode) {
-        if (newMode.equals(currentMode)) {
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 模式未变化: " + newMode);
-            return;
-        }
-
-        // 停止旧模式
-        if (currentMode.equals(MODE_WORKER_THREAD)) {
-            stopWorkerThread();
-        }
-
-        // 更新配置
-        String oldMode = currentMode;
+        if (newMode.equals(currentMode)) return;
+        if (MODE_WORKER_THREAD.equals(currentMode)) stopWorkerThread();
+        String old = currentMode;
         currentMode = newMode;
         prefs.edit().putString("exec_mode", newMode).apply();
-        XposedBridge.log(TAG + " [" + currentPackageName + "] 执行模式已切换: " + oldMode + " -> " + newMode);
-
-        // 启动新模式
+        XposedBridge.log(TAG + " 模式切换 " + old + " -> " + newMode);
         applyExecutionMode();
     }
 
     /**
-     * 获取当前配置信息
+     * 获取当前运行配置JSON
      */
     private JSONObject getConfigInfo() {
         JSONObject config = new JSONObject();
         try {
             config.put("currentMode", currentMode);
             config.put("modeDescriptions", new JSONObject()
-                .put(MODE_FOREGROUND_SERVICE, "前台服务保活 - 进程优先级最高，最稳定")
-                .put(MODE_WORKER_THREAD, "子线程轮询 - 默认模式，平衡性能与稳定性")
-                .put(MODE_TEMP_WAKEUP, "临时唤醒 - 最省电，但可能不稳定")
+                    .put(MODE_FOREGROUND_SERVICE, "前台服务保活 - 进程优先级最高，最稳定")
+                    .put(MODE_WORKER_THREAD, "子线程轮询 - 默认模式，平衡性能与稳定性")
+                    .put(MODE_TEMP_WAKEUP, "临时唤醒 - 最省电，但可能不稳定")
             );
             config.put("isWorkerThreadRunning", workerThread != null && workerThread.isAlive());
             config.put("isForegroundServiceRunning", isForegroundServiceRunning);
         } catch (Exception e) {
-            XposedBridge.log(TAG + " 获取配置信息失败: " + e.getMessage());
+            XposedBridge.log(TAG + " 获取配置失败:" + e.getMessage());
         }
         return config;
     }
 
+    @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam loadPackageParam) throws Throwable {
-        // 支持微信分身：检测所有微信相关包
-        if (!isWeChatPackage(loadPackageParam.packageName)) {
-            return;
-        }
+        if (!isWeChatPackage(loadPackageParam.packageName)) return;
         currentPackageName = loadPackageParam.packageName;
-        // 注意：此时还不能获取 userId，需要等 Application.attach 后才能获取 context
-        XposedBridge.log(TAG + " 检测到微信包: " + currentPackageName);
-        try {
-            Class<?> cls = Class.forName("android.app.Application");
-            Object[] objArr = new Object[2];
-            try {
-                objArr[0] = Class.forName("android.content.Context");
-                objArr[1] = new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam methodHookParam) throws Throwable {
-                        super.afterHookedMethod(methodHookParam);
-                        Context context = (Context) methodHookParam.args[0];
-                        ClassLoader classLoader = context.getClassLoader();
-
-                        // 先设置 appContext，才能获取 userId（getUserId 需要 appContext）
-                        WxLoginHook.this.appContext = context;
-
-                        // 获取当前实例的 User ID（区分系统级分身）
-                        WxLoginHook.this.currentUserId = WxLoginHook.this.getUserId();
-
-                        // 根据 User ID 和包名计算端口
-                        WxLoginHook.this.httpPort = WxLoginHook.this.calculatePort(WxLoginHook.this.currentPackageName, WxLoginHook.this.currentUserId);
-
-                        // 使用当前包名获取版本信息（支持分身）
-                        PackageInfo packageInfo = context.getPackageManager().getPackageInfo(WxLoginHook.this.currentPackageName, 0);
-                        WxLoginHook.this.versionName = packageInfo.versionName;
-                        XposedBridge.log(TAG + " [" + WxLoginHook.this.currentPackageName + " User:" + WxLoginHook.this.currentUserId + "] 当前版本: " + WxLoginHook.this.versionName);
-                        try {
-                            JSONObject jSONObject = new JSONObject(WxLoginHook.this.jsonString).getJSONObject(WxLoginHook.this.versionName);
-                            WxLoginHook.this.j1 = jSONObject.getString("j1");
-                            WxLoginHook.this.c = jSONObject.getString("c");
-                            XposedBridge.log(TAG + " [" + WxLoginHook.this.currentPackageName + "] 已读取" + WxLoginHook.this.versionName + "配置: " + jSONObject);
-                        } catch (Exception e) {
-                            XposedBridge.log(TAG + " [" + WxLoginHook.this.currentPackageName + "] 版本配置读取失败: " + e.getMessage());
-                            e.printStackTrace();
-                        }
-                        try {
-                            WxLoginHook.this.httpServer = new LoginHttpServer(WxLoginHook.this, WxLoginHook.this.httpPort, classLoader);
-                            WxLoginHook.this.httpServer.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false);
-                            XposedBridge.log(TAG + " [" + WxLoginHook.this.currentPackageName + " User:" + WxLoginHook.this.currentUserId + "] HTTP服务启动成功: http://设备IP:" + WxLoginHook.this.httpPort + "/login");
-                            // 注册当前实例到共享文件，供其他实例发现
-                            WxLoginHook.this.registerInstance(WxLoginHook.this.currentPackageName, WxLoginHook.this.currentUserId, WxLoginHook.this.httpPort, WxLoginHook.this.versionName);
-                            // 初始化执行模式配置
-                            WxLoginHook.this.initConfig(context);
-                        } catch (IOException e2) {
-                            XposedBridge.log(TAG + " [" + WxLoginHook.this.currentPackageName + "] HTTP服务启动失败: " + e2.getMessage());
-                            e2.printStackTrace();
-                        }
-                    }
-                };
-                XposedHelpers.findAndHookMethod(cls, "attach", objArr);
-            } catch (ClassNotFoundException e) {
-                throw new NoClassDefFoundError(e.getMessage());
+        XposedBridge.log(TAG + " 捕获微信包: " + currentPackageName);
+        Class<?> appCls = Class.forName("android.app.Application");
+        XposedHelpers.findAndHookMethod(appCls, "attach", Context.class, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                Context context = (Context) param.args[0];
+                ClassLoader classLoader = context.getClassLoader();
+                appContext = context;
+                // 初始化全局共享注册表路径
+                initRegistryFilePath();
+                currentUserId = getUserId();
+                httpPort = calculatePort(currentPackageName, currentUserId);
+                PackageInfo pkgInfo = context.getPackageManager().getPackageInfo(currentPackageName, 0);
+                versionName = pkgInfo.versionName;
+                XposedBridge.log(TAG + " [" + currentPackageName + "] UID:" + currentUserId + " Ver:" + versionName + " Port:" + httpPort);
+                try {
+                    JSONObject verCfg = new JSONObject(jsonString).getJSONObject(versionName);
+                    j1 = verCfg.getString("j1");
+                    c = verCfg.getString("c");
+                    XposedBridge.log(TAG + " 版本配置加载成功: " + verCfg);
+                } catch (Exception e) {
+                    XposedBridge.log(TAG + " 版本配置不存在: " + e.getMessage());
+                }
+                try {
+                    httpServer = new LoginHttpServer(WxLoginHook.this, httpPort, classLoader);
+                    httpServer.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false);
+                    XposedBridge.log(TAG + " HTTP服务启动成功 http://0.0.0.0:" + httpPort);
+                    // 写入全局共享注册表
+                    registerInstance(currentPackageName, currentUserId, httpPort, versionName);
+                    initConfig(context);
+                } catch (IOException e) {
+                    XposedBridge.log(TAG + " HTTP服务启动失败:" + e.getMessage());
+                }
             }
-        } catch (ClassNotFoundException e2) {
-            throw new NoClassDefFoundError(e2.getMessage());
-        }
+        });
     }
 
-    /* JADX INFO: Access modifiers changed from: private */
-    /* JADX WARN: Multi-variable type inference failed */
+    /**
+     * 执行小程序登录，获取code
+     */
     public String doLogin(final String str, ClassLoader classLoader) {
-        if (this.isLoginInFlight) {
-            return "{\"err\":-100,\"msg\":\"登录请求正在处理中\"}";
-        }
-        this.isLoginInFlight = true;
-        final String[] strArr = {null};
-        PowerManager.WakeLock tempWakeLock = null;  // 临时 WakeLock，用于登录期间保活
+        if (isLoginInFlight) return "{\"err\":-100,\"msg\":\"登录请求正在处理中\"}";
+        isLoginInFlight = true;
+        final String[] res = {null};
+        PowerManager.WakeLock tempWakeLock = null;
         try {
-            Class<?> clsFindClass = XposedHelpers.findClass("com.tencent.mm.plugin.appbrand.jsapi.auth.JsApiLogin$LoginTask", classLoader);
-            Class clsFindClass2 = XposedHelpers.findClass("com.tencent.mm.plugin.appbrand.jsapi.auth.h2", classLoader);
-            Class clsFindClass3 = XposedHelpers.findClass("com.tencent.mm.plugin.appbrand.jsapi.auth.l2", classLoader);
-            Class<?> clsFindClass4 = XposedHelpers.findClass(this.c, classLoader);
-            Class clsFindClass5 = XposedHelpers.findClass(this.j1, classLoader);
-            XposedBridge.log(TAG + " [" + currentPackageName + "] 发起登录请求: appId=" + str);
-
-            // 检查微信是否在前台，如果不在前台则自动唤醒
-            boolean needWakeup = !isWeChatForeground();
-            if (needWakeup) {
-                XposedBridge.log(TAG + " [" + currentPackageName + "] 微信不在前台，正在唤醒...");
+            Class<?> LoginTaskCls = XposedHelpers.findClass("com.tencent.mm.plugin.appbrand.jsapi.auth.JsApiLogin$LoginTask", classLoader);
+            Class<?> h2Cls = XposedHelpers.findClass("com.tencent.mm.plugin.appbrand.jsapi.auth.h2", classLoader);
+            Class<?> l2Cls = XposedHelpers.findClass("com.tencent.mm.plugin.appbrand.jsapi.auth.l2", classLoader);
+            Class<?> cCls = XposedHelpers.findClass(this.c, classLoader);
+            Class<?> j1Cls = XposedHelpers.findClass(this.j1, classLoader);
+            XposedBridge.log(TAG + " 发起登录 appId=" + str);
+            boolean needWake = !isWeChatForeground();
+            if (needWake) {
                 tempWakeupWeChat();
-                // 等待微信启动
                 Thread.sleep(1000);
-                // 再次检查
-                if (!isWeChatForeground()) {
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] 唤醒后仍不在前台，继续尝试登录");
-                }
             }
-
-            // 强制伪造前台状态（尝试绕过微信的前台检测）
             forceForegroundState(classLoader);
-
-            final Object objNewInstance = XposedHelpers.newInstance(clsFindClass, new Object[0]);
-            setField(objNewInstance, "o", "login");
-            setField(objNewInstance, "p", str);
-            setField(objNewInstance, "s", Integer.valueOf(1));
-            setField(objNewInstance, "v", "");
-            setField(objNewInstance, "t", Integer.valueOf(0));
-            setField(objNewInstance, "u", Integer.valueOf(0));
-            setField(objNewInstance, "A", Integer.valueOf(1271));
-            XposedHelpers.callMethod(XposedHelpers.callStaticMethod(clsFindClass5, "d", new Object[0]), "g", new Object[]{findHe0cConstructor(clsFindClass4).newInstance(str, new LinkedList(), Integer.valueOf(1), "", "", Integer.valueOf(0), Integer.valueOf(1271), XposedHelpers.newInstance(clsFindClass3, new Object[]{objNewInstance, clsFindClass2.getConstructor(clsFindClass).newInstance(objNewInstance)}))});
-            final long jCurrentTimeMillis = System.currentTimeMillis();
-
-            // 登录前确保 WakeLock 被持有（临时获取，最多30秒）
+            Object loginTask = XposedHelpers.newInstance(LoginTaskCls);
+            setField(loginTask, "o", "login");
+            setField(loginTask, "p", str);
+            setField(loginTask, "s", 1);
+            setField(loginTask, "v", "");
+            setField(loginTask, "t", 0);
+            setField(loginTask, "u", 0);
+            setField(loginTask, "A", 1271);
+            Constructor<?> ctor = findHe0cConstructor(cCls);
+            Object h2Obj = h2Cls.getConstructor(LoginTaskCls).newInstance(loginTask);
+            Object l2Obj = XposedHelpers.newInstance(l2Cls, loginTask, h2Obj);
+            Object cObj = ctor.newInstance(str, new LinkedList<>(), 1, "", "", 0, 1271, l2Obj);
+            XposedHelpers.callMethod(XposedHelpers.callStaticMethod(j1Cls, "d"), "g", cObj);
+            long start = System.currentTimeMillis();
             if (wakeLock == null || !wakeLock.isHeld()) {
-                try {
-                    PowerManager pm = (PowerManager) appContext.getSystemService(Context.POWER_SERVICE);
-                    tempWakeLock = pm.newWakeLock(
-                        PowerManager.PARTIAL_WAKE_LOCK,
-                        "wxcode:login_temp_" + currentPackageName
-                    );
-                    tempWakeLock.acquire(30 * 1000L);  // 最多30秒
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] 临时 WakeLock 已获取");
-                } catch (Exception e) {
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] 获取临时 WakeLock 失败: " + e.getMessage());
-                }
+                PowerManager pm = (PowerManager) appContext.getSystemService(Context.POWER_SERVICE);
+                tempWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wxcode:login_temp_" + currentPackageName);
+                tempWakeLock.acquire(30000);
             }
-
-            // 根据执行模式选择 Handler
-            final Handler handler;
-            if (currentMode.equals(MODE_TEMP_WAKEUP)) {
-                // 临时唤醒模式：先唤醒微信到前台
-                XposedBridge.log(TAG + " [" + currentPackageName + "] 临时唤醒模式：唤醒微信");
+            Handler handler;
+            if (MODE_TEMP_WAKEUP.equals(currentMode)) {
                 tempWakeupWeChat();
                 handler = new Handler(Looper.getMainLooper());
-            } else if (currentMode.equals(MODE_WORKER_THREAD) && workerHandler != null) {
-                // 子线程模式：使用工作线程 Handler
-                XposedBridge.log(TAG + " [" + currentPackageName + "] 子线程模式：使用工作线程轮询");
+            } else if (MODE_WORKER_THREAD.equals(currentMode) && workerHandler != null) {
                 handler = workerHandler;
             } else {
-                // 前台服务模式或默认：使用主线程 Handler
-                XposedBridge.log(TAG + " [" + currentPackageName + "] 前台服务模式：使用主线程轮询");
                 handler = new Handler(Looper.getMainLooper());
             }
-
-            final Object obj = new Object();
-            Runnable runnable = new Runnable() {
+            Object lockObj = new Object();
+            Runnable pollTask = new Runnable() {
                 @Override
                 public void run() {
-                    String str2;
-                    String str3;
-                    synchronized (obj) {
+                    synchronized (lockObj) {
                         try {
-                            str2 = (String) WxLoginHook.this.getField(objNewInstance, "r");
-                            str3 = (String) WxLoginHook.this.getField(objNewInstance, "q");
-                        } catch (Throwable th) {
-                            XposedBridge.log(TAG + " 轮询异常: " + th.getMessage());
-                            handler.postDelayed(this, 200);
-                            return;
-                        }
-                        if (str2 == null) {
-                            if (System.currentTimeMillis() - jCurrentTimeMillis <= 15000) {
-                                handler.postDelayed(this, 200);
-                                return;
-                            } else {
-                                strArr[0] = "{\"err\":-210,\"msg\":\"登录请求超时\"}";
-                                synchronized (obj) {
-                                    obj.notify();
+                            String code = (String) getField(loginTask, "r");
+                            String rawCode = (String) getField(loginTask, "q");
+                            if (code == null) {
+                                if (System.currentTimeMillis() - start <= 15000) {
+                                    handler.postDelayed(this, 200);
+                                    return;
+                                } else {
+                                    res[0] = "{\"err\":-210,\"msg\":\"登录超时\"}";
+                                    lockObj.notify();
+                                    return;
                                 }
-                                return;
                             }
-                        }
-                        String strClassifyCode = WxLoginHook.this.classifyCode(str3);
-                        strArr[0] = String.format("{\"err\":0,\"msg\":\"success\",\"appId\":\"%s\",\"status\":\"%s\",\"code\":\"%s\",\"codeType\":\"%s\",\"codeLength\":%d}", str, str2, str3, strClassifyCode, str3 == null ? 0 : str3.length());
-                        synchronized (obj) {
-                            obj.notify();
+                            String type = classifyCode(rawCode);
+                            res[0] = String.format("{\"err\":0,\"msg\":\"success\",\"appId\":\"%s\",\"status\":\"%s\",\"code\":\"%s\",\"codeType\":\"%s\",\"codeLength\":%d}",
+                                    str, code, rawCode, type, rawCode == null ? 0 : rawCode.length());
+                            lockObj.notify();
+                        } catch (Throwable e) {
+                            XposedBridge.log(TAG + " 轮询异常:" + e.getMessage());
+                            handler.postDelayed(this, 200);
                         }
                     }
                 }
             };
-            synchronized (obj) {
-                handler.post(runnable);
-                obj.wait(16000L);
+            synchronized (lockObj) {
+                handler.post(pollTask);
+                lockObj.wait(16000);
             }
-            if (strArr[0] == null) {
-                strArr[0] = "{\"err\":-210,\"msg\":\"登录请求超时\"}";
-            }
+            if (res[0] == null) res[0] = "{\"err\":-210,\"msg\":\"登录超时\"}";
         } catch (Throwable e) {
-            XposedBridge.log(TAG + " doLogin异常: " + e.getMessage());
-            strArr[0] = "{\"err\":-500,\"msg\":\"" + e.getMessage().replace("\"", "\\\"") + "\"}";
+            XposedBridge.log(TAG + " doLogin异常:" + e.getMessage());
+            res[0] = "{\"err\":-500,\"msg\":\"" + e.getMessage().replace("\"", "\\\"") + "\"}";
         } finally {
-            this.isLoginInFlight = false;
-            // 恢复原始前台状态（避免持续耗电）
+            isLoginInFlight = false;
             restoreForegroundState();
-            // 释放临时 WakeLock
             if (tempWakeLock != null && tempWakeLock.isHeld()) {
-                try {
-                    tempWakeLock.release();
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] 临时 WakeLock 已释放");
-                } catch (Exception e) {
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] 释放临时 WakeLock 失败: " + e.getMessage());
-                }
+                tempWakeLock.release();
             }
         }
-        return strArr[0];
+        return res[0];
     }
 
-    private void setField(Object obj, String str, Object obj2) throws Throwable {
-        Field declaredField = obj.getClass().getDeclaredField(str);
-        declaredField.setAccessible(true);
-        declaredField.set(obj, obj2);
+    /**
+     * 反射设置对象字段
+     */
+    private void setField(Object obj, String name, Object val) throws Throwable {
+        Field f = obj.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        f.set(obj, val);
     }
 
-    /* JADX INFO: Access modifiers changed from: private */
-    public Object getField(Object obj, String str) throws Throwable {
-        Field declaredField = obj.getClass().getDeclaredField(str);
-        declaredField.setAccessible(true);
-        return declaredField.get(obj);
+    /**
+     * 反射读取对象字段
+     */
+    private Object getField(Object obj, String name) throws Throwable {
+        Field f = obj.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        return f.get(obj);
     }
 
-    /* JADX WARN: Removed duplicated region for block: B:23:0x0043  */
-    /* JADX WARN: Removed duplicated region for block: B:43:0x0079  */
-    /* JADX WARN: Removed duplicated region for block: B:53:0x0097  */
-    /*
-        查找微信内部类的构造函数
-        参数签名: (String, LinkedList, Integer, String, String, Integer, Integer, Object)
-    */
-    private java.lang.reflect.Constructor<?> findHe0cConstructor(java.lang.Class<?> clazz) {
-        // 查找接受8个参数的构造函数
-        for (java.lang.reflect.Constructor<?> constructor : clazz.getDeclaredConstructors()) {
-            if (constructor.getParameterCount() == 8) {
-                constructor.setAccessible(true);
-                return constructor;
+    /**
+     * 匹配8参数构造函数，兼容微信内部类
+     */
+    private Constructor<?> findHe0cConstructor(Class<?> clazz) {
+        for (Constructor<?> c : clazz.getDeclaredConstructors()) {
+            if (c.getParameterCount() == 8) {
+                c.setAccessible(true);
+                return c;
             }
         }
-        // 如果没找到8参数的，尝试查找其他构造函数
-        for (java.lang.reflect.Constructor<?> constructor : clazz.getDeclaredConstructors()) {
-            if (constructor.getParameterCount() >= 6) {
-                constructor.setAccessible(true);
-                return constructor;
+        for (Constructor<?> c : clazz.getDeclaredConstructors()) {
+            if (c.getParameterCount() >= 6) {
+                c.setAccessible(true);
+                return c;
             }
         }
-        throw new RuntimeException("找不到合适的构造函数 for " + clazz.getName());
+        throw new RuntimeException("未找到目标构造函数:" + clazz.getName());
     }
 
-    /* JADX INFO: Access modifiers changed from: private */
-    public String classifyCode(String str) {
-        if (str == null || str.isEmpty()) {
-            return "invalid";
-        }
-        return str.matches("^[0-9a-fA-F]+$") ? "hex" : str.matches("^[A-Za-z0-9+\\/=]+$") ? "base64" : str.matches("^[A-Za-z0-9_\\-]+$") ? "base64url" : str.matches("^[A-Za-z0-9]+$") ? "alnum" : "other";
+    /**
+     * 识别code编码类型
+     */
+    private String classifyCode(String str) {
+        if (str == null || str.isEmpty()) return "invalid";
+        if (str.matches("^[0-9a-fA-F]+$")) return "hex";
+        if (str.matches("^[A-Za-z0-9+\\/=]+$")) return "base64";
+        if (str.matches("^[A-Za-z0-9_\\-]+$")) return "base64url";
+        if (str.matches("^[A-Za-z0-9]+$")) return "alnum";
+        return "other";
     }
 
+    /**
+     * HTTP服务内部类
+     */
     class LoginHttpServer extends NanoHTTPD {
+        private final WxLoginHook outer;
         private final ClassLoader classLoader;
-        private final WxLoginHook this$0;
 
-        public LoginHttpServer(WxLoginHook wxLoginHook, int i, ClassLoader classLoader) {
-            super(i);
-            this.this$0 = wxLoginHook;
-            this.classLoader = classLoader;
+        public LoginHttpServer(WxLoginHook hook, int port, ClassLoader cl) {
+            super(port);
+            outer = hook;
+            classLoader = cl;
         }
 
-        @Override // fi.iki.elonen.NanoHTTPD
+        @Override
         public NanoHTTPD.Response serve(NanoHTTPD.IHTTPSession iHTTPSession) {
             if (!iHTTPSession.getMethod().equals(NanoHTTPD.Method.GET)) {
                 return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.NOT_FOUND, "application/json", "{\"err\":-404,\"msg\":\"接口不存在\"}");
@@ -1027,12 +802,12 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             if (uri.equals("/whoami")) {
                 try {
                     JSONObject info = new JSONObject();
-                    info.put("packageName", this.this$0.currentPackageName);
-                    info.put("userId", this.this$0.currentUserId);
-                    info.put("port", this.this$0.httpPort);
-                    info.put("version", this.this$0.versionName);
-                    info.put("j1", this.this$0.j1);
-                    info.put("c", this.this$0.c);
+                    info.put("packageName", outer.currentPackageName);
+                    info.put("userId", outer.currentUserId);
+                    info.put("port", outer.httpPort);
+                    info.put("version", outer.versionName);
+                    info.put("j1", outer.j1);
+                    info.put("c", outer.c);
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", info.toString());
                 } catch (Exception e) {
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "application/json", "{\"err\":-500,\"msg\":\"" + e.getMessage() + "\"}");
@@ -1042,10 +817,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             // /instances 接口：返回所有已启动的实例（实时数据）
             if (uri.equals("/instances")) {
                 try {
-                    JSONArray registry = this.this$0.readRegistry();
-                    registry = this.this$0.cleanExpiredInstances(registry);
+                    JSONArray registry = outer.readRegistry();
+                    registry = outer.cleanExpiredInstances(registry);
 
-                    // 构建端口映射表，方便查看
                     JSONObject portMap = new JSONObject();
                     for (int i = 0; i < registry.length(); i++) {
                         JSONObject item = registry.getJSONObject(i);
@@ -1055,12 +829,12 @@ public class WxLoginHook implements IXposedHookLoadPackage {
 
                     JSONObject result = new JSONObject();
                     result.put("instances", registry);
-                    result.put("portMap", portMap);  // 简化的端口映射表
-                    result.put("current", this.this$0.currentPackageName);
-                    result.put("currentUserId", this.this$0.currentUserId);
-                    result.put("currentPort", this.this$0.httpPort);
+                    result.put("portMap", portMap);
+                    result.put("current", outer.currentPackageName);
+                    result.put("currentUserId", outer.currentUserId);
+                    result.put("currentPort", outer.httpPort);
                     result.put("count", registry.length());
-                    result.put("registryFile", this.this$0.registryFilePath);  // 显示注册表文件路径
+                    result.put("registryFile", outer.registryFilePath);
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", result.toString());
                 } catch (Exception e) {
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "application/json", "{\"err\":-500,\"msg\":\"" + e.getMessage() + "\"}");
@@ -1072,16 +846,14 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 try {
                     String mode = iHTTPSession.getParms().get("mode");
                     if (mode != null && !mode.isEmpty()) {
-                        // 更新配置
-                        this.this$0.updateExecutionMode(mode);
+                        outer.updateExecutionMode(mode);
                         JSONObject result = new JSONObject();
                         result.put("success", true);
-                        result.put("currentMode", this.this$0.currentMode);
+                        result.put("currentMode", outer.currentMode);
                         result.put("message", "执行模式已更新为: " + mode);
                         return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", result.toString());
                     } else {
-                        // 返回当前配置
-                        return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", this.this$0.getConfigInfo().toString());
+                        return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", outer.getConfigInfo().toString());
                     }
                 } catch (Exception e) {
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "application/json", "{\"err\":-500,\"msg\":\"" + e.getMessage() + "\"}");
@@ -1090,297 +862,267 @@ public class WxLoginHook implements IXposedHookLoadPackage {
 
             // /login 接口：执行登录
             if (uri.equals("/login")) {
-                return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", this.this$0.doLogin(iHTTPSession.getParms().getOrDefault("appId", "wxaa3a999db5d744c6"), this.classLoader));
+                return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", outer.doLogin(iHTTPSession.getParms().getOrDefault("appId", DEFAULT_AUTO_APP_ID), classLoader));
             }
 
-            // 其他路径：显示HTML帮助页面
-                try {
-                    JSONObject jSONObject = new JSONObject(this.this$0.jsonString);
-                    StringBuilder sb = new StringBuilder();
-                    sb.append("<!DOCTYPE html>");
-                    sb.append("<html lang='zh-CN'>");
-                    sb.append("<head>");
-                    sb.append("<meta charset='UTF-8'>");
-                    sb.append("<meta name='viewport' content='width=device-width, initial-scale=1.0'>");
-                    sb.append("<title>wxcode版本信息</title>");
-                    sb.append("<style>");
-                    sb.append("body {");
-                    sb.append("  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;");
-                    sb.append("  line-height: 1.6;");
-                    sb.append("  margin: 0;");
-                    sb.append("  padding: 20px;");
-                    sb.append("  background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);");
-                    sb.append("  min-height: 100vh;");
-                    sb.append("}");
-                    sb.append(".container {");
-                    sb.append("  max-width: 1000px;");
-                    sb.append("  margin: 0 auto;");
-                    sb.append("  background-color: white;");
-                    sb.append("  border-radius: 15px;");
-                    sb.append("  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);");
-                    sb.append("  padding: 30px;");
-                    sb.append("}");
-                    sb.append("h1 {");
-                    sb.append("  color: #2c3e50;");
-                    sb.append("  text-align: center;");
-                    sb.append("  margin-bottom: 30px;");
-                    sb.append("  font-size: 2.5em;");
-                    sb.append("  border-bottom: 3px solid #3498db;");
-                    sb.append("  padding-bottom: 10px;");
-                    sb.append("}");
-                    sb.append("h2 {");
-                    sb.append("  color: #34495e;");
-                    sb.append("  margin-top: 30px;");
-                    sb.append("  margin-bottom: 15px;");
-                    sb.append("  font-size: 1.5em;");
-                    sb.append("  display: flex;");
-                    sb.append("  align-items: center;");
-                    sb.append("}");
-                    sb.append("h2:before {");
-                    sb.append("  content: '';");
-                    sb.append("  width: 4px;");
-                    sb.append("  height: 24px;");
-                    sb.append("  background: #3498db;");
-                    sb.append("  margin-right: 10px;");
-                    sb.append("  border-radius: 2px;");
-                    sb.append("}");
-                    sb.append("p {");
-                    sb.append("  background: #f8f9fa;");
-                    sb.append("  padding: 12px 15px;");
-                    sb.append("  border-radius: 8px;");
-                    sb.append("  margin: 10px 0;");
-                    sb.append("  border-left: 4px solid #3498db;");
-                    sb.append("}");
-                    sb.append("a {");
-                    sb.append("  color: #3498db;");
-                    sb.append("  text-decoration: none;");
-                    sb.append("  font-weight: bold;");
-                    sb.append("  transition: all 0.3s ease;");
-                    sb.append("}");
-                    sb.append("a:hover {");
-                    sb.append("  color: #2980b9;");
-                    sb.append("  text-decoration: underline;");
-                    sb.append("}");
-                    sb.append("table {");
-                    sb.append("  width: 100%;");
-                    sb.append("  border-collapse: collapse;");
-                    sb.append("  margin-top: 20px;");
-                    sb.append("  box-shadow: 0 5px 15px rgba(0, 0, 0, 0.05);");
-                    sb.append("  border-radius: 10px;");
-                    sb.append("  overflow: hidden;");
-                    sb.append("}");
-                    sb.append("th {");
-                    sb.append("  background: linear-gradient(to right, #3498db, #2c3e50);");
-                    sb.append("  color: white;");
-                    sb.append("  padding: 15px;");
-                    sb.append("  text-align: left;");
-                    sb.append("  font-weight: 600;");
-                    sb.append("  letter-spacing: 0.5px;");
-                    sb.append("}");
-                    sb.append("td {");
-                    sb.append("  padding: 12px 15px;");
-                    sb.append("  border-bottom: 1px solid #eee;");
-                    sb.append("}");
-                    sb.append("tr:nth-child(even) {");
-                    sb.append("  background-color: #f8f9fa;");
-                    sb.append("}");
-                    sb.append("tr:hover {");
-                    sb.append("  background-color: #e8f4fc;");
-                    sb.append("  transition: background-color 0.2s ease;");
-                    sb.append("}");
-                    sb.append(".version {");
-                    sb.append("  font-weight: bold;");
-                    sb.append("  color: #2c3e50;");
-                    sb.append("}");
-                    sb.append(".code {");
-                    sb.append("  font-family: 'Courier New', monospace;");
-                    sb.append("  background: #f1f1f1;");
-                    sb.append("  padding: 3px 6px;");
-                    sb.append("  border-radius: 4px;");
-                    sb.append("  color: #e74c3c;");
-                    sb.append("}");
-                    sb.append(".footer {");
-                    sb.append("  text-align: center;");
-                    sb.append("  margin-top: 30px;");
-                    sb.append("  color: #7f8c8d;");
-                    sb.append("  font-size: 0.9em;");
-                    sb.append("}");
-                    sb.append(".mode-btn {");
-                    sb.append("  display: inline-block;");
-                    sb.append("  padding: 10px 20px;");
-                    sb.append("  margin: 5px;");
-                    sb.append("  border: 2px solid #3498db;");
-                    sb.append("  border-radius: 8px;");
-                    sb.append("  cursor: pointer;");
-                    sb.append("  transition: all 0.3s ease;");
-                    sb.append("  background: white;");
-                    sb.append("  color: #3498db;");
-                    sb.append("  font-weight: bold;");
-                    sb.append("  text-decoration: none;");
-                    sb.append("}");
-                    sb.append(".mode-btn:hover {");
-                    sb.append("  background: #3498db;");
-                    sb.append("  color: white;");
-                    sb.append("}");
-                    sb.append(".mode-btn.active {");
-                    sb.append("  background: #27ae60;");
-                    sb.append("  color: white;");
-                    sb.append("  border-color: #27ae60;");
-                    sb.append("}");
-                    sb.append(".mode-desc {");
-                    sb.append("  font-size: 0.85em;");
-                    sb.append("  color: #7f8c8d;");
-                    sb.append("  margin-top: 5px;");
-                    sb.append("}");
-                    sb.append(".current-mode {");
-                    sb.append("  background: #e8f8f5;");
-                    sb.append("  padding: 10px 15px;");
-                    sb.append("  border-radius: 8px;");
-                    sb.append("  border-left: 4px solid #27ae60;");
-                    sb.append("  margin: 15px 0;");
-                    sb.append("}");
-                    sb.append(".instance-list {");
-                    sb.append("  margin-top: 15px;");
-                    sb.append("}");
-                    sb.append(".instance-item {");
-                    sb.append("  background: #f8f9fa;");
-                    sb.append("  padding: 10px 15px;");
-                    sb.append("  border-radius: 8px;");
-                    sb.append("  margin: 8px 0;");
-                    sb.append("  border-left: 4px solid #3498db;");
-                    sb.append("  display: flex;");
-                    sb.append("  justify-content: space-between;");
-                    sb.append("  align-items: center;");
-                    sb.append("}");
-                    sb.append(".instance-item.current {");
-                    sb.append("  border-left-color: #27ae60;");
-                    sb.append("  background: #e8f8f5;");
-                    sb.append("}");
-                    sb.append(".instance-item .port {");
-                    sb.append("  font-weight: bold;");
-                    sb.append("  color: #3498db;");
-                    sb.append("  font-size: 1.2em;");
-                    sb.append("}");
-                    sb.append(".instance-item.current .port {");
-                    sb.append("  color: #27ae60;");
-                    sb.append("}");
-                    sb.append("</style>");
-                    sb.append("</head>");
-                    sb.append("<body>");
-                    sb.append("<div class='container'>");
-                    sb.append("<h1>📦 wxcode </h1>");
+            // 首页HTML页面
+            try {
+                JSONObject jSONObject = new JSONObject(outer.jsonString);
+                StringBuilder sb = new StringBuilder();
+                sb.append("<!DOCTYPE html>");
+                sb.append("<html lang='zh-CN'>");
+                sb.append("<head>");
+                sb.append("<meta charset='UTF-8'>");
+                sb.append("<meta name='viewport' content='width=device-width, initial-scale=1.0'>");
+                sb.append("<title>wxcode版本信息</title>");
+                sb.append("<style>");
+                sb.append("body {");
+                sb.append("  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;");
+                sb.append("  line-height: 1.6;");
+                sb.append("  margin: 0;");
+                sb.append("  padding: 20px;");
+                sb.append("  background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);");
+                sb.append("  min-height: 100vh;");
+                sb.append("}");
+                sb.append(".container {");
+                sb.append("  max-width: 1000px;");
+                sb.append("  margin: 0 auto;");
+                sb.append("  background-color: white;");
+                sb.append("  border-radius: 15px;");
+                sb.append("  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);");
+                sb.append("  padding: 30px;");
+                sb.append("}");
+                sb.append("h1 {");
+                sb.append("  color: #2c3e50;");
+                sb.append("  text-align: center;");
+                sb.append("  margin-bottom: 30px;");
+                sb.append("  font-size: 2.5em;");
+                sb.append("  border-bottom: 3px solid #3498db;");
+                sb.append("  padding-bottom: 10px;");
+                sb.append("}");
+                sb.append("h2 {");
+                sb.append("  color: #34495e;");
+                sb.append("  margin-top: 30px;");
+                sb.append("  margin-bottom: 15px;");
+                sb.append("  font-size: 1.5em;");
+                sb.append("  display: flex;");
+                sb.append("  align-items: center;");
+                sb.append("}");
+                sb.append("h2:before {");
+                sb.append("  content: '';");
+                sb.append("  width: 4px;");
+                sb.append("  height: 24px;");
+                sb.append("  background: #3498db;");
+                sb.append("  margin-right: 10px;");
+                sb.append("  border-radius: 2px;");
+                sb.append("}");
+                sb.append("p {");
+                sb.append("  background: #f8f9fa;");
+                sb.append("  padding: 12px 15px;");
+                sb.append("  border-radius: 8px;");
+                sb.append("  margin: 10px 0;");
+                sb.append("  border-left: 4px solid #3498db;");
+                sb.append("}");
+                sb.append("a {");
+                sb.append("  color: #3498db;");
+                sb.append("  text-decoration: none;");
+                sb.append("  font-weight: bold;");
+                sb.append("  transition: all 0.3s ease;");
+                sb.append("}");
+                sb.append("a:hover {");
+                sb.append("  color: #2980b9;");
+                sb.append("  text-decoration: underline;");
+                sb.append("}");
+                sb.append("table {");
+                sb.append("  width: 100%;");
+                sb.append("  border-collapse: collapse;");
+                sb.append("  margin-top: 20px;");
+                sb.append("  box-shadow: 0 5px 15px rgba(0, 0, 0, 0.05);");
+                sb.append("  border-radius: 10px;");
+                sb.append("  overflow: hidden;");
+                sb.append("}");
+                sb.append("th {");
+                sb.append("  background: linear-gradient(to right, #3498db, #2c3e50);");
+                sb.append("  color: white;");
+                sb.append("  padding: 15px;");
+                sb.append("  text-align: left;");
+                sb.append("  font-weight: 600;");
+                sb.append("  letter-spacing: 0.5px;");
+                sb.append("}");
+                sb.append("td {");
+                sb.append("  padding: 12px 15px;");
+                sb.append("  border-bottom: 1px solid #eee;");
+                sb.append("}");
+                sb.append("tr:nth-child(even) {");
+                sb.append("  background-color: #f8f9fa;");
+                sb.append("}");
+                sb.append("tr:hover {");
+                sb.append("  background-color: #e8f4fc;");
+                sb.append("  transition: background-color 0.2s ease;");
+                sb.append("}");
+                sb.append(".version {");
+                sb.append("  font-weight: bold;");
+                sb.append("  color: #2c3e50;");
+                sb.append("}");
+                sb.append(".code {");
+                sb.append("  font-family: 'Courier New', monospace;");
+                sb.append("  background: #f1f1f1;");
+                sb.append("  padding: 3px 6px;");
+                sb.append("  border-radius: 4px;");
+                sb.append("  color: #e74c3c;");
+                sb.append("}");
+                sb.append(".footer {");
+                sb.append("  text-align: center;");
+                sb.append("  margin-top: 30px;");
+                sb.append("  color: #7f8c8d;");
+                sb.append("  font-size: 0.9em;");
+                sb.append("}");
+                sb.append(".mode-btn {");
+                sb.append("  display: inline-block;");
+                sb.append("  padding: 10px 20px;");
+                sb.append("  margin: 5px;");
+                sb.append("  border: 2px solid #3498db;");
+                sb.append("  border-radius: 8px;");
+                sb.append("  cursor: pointer;");
+                sb.append("  transition: all 0.3s ease;");
+                sb.append("  background: white;");
+                sb.append("  color: #3498db;");
+                sb.append("  font-weight: bold;");
+                sb.append("  text-decoration: none;");
+                sb.append("}");
+                sb.append(".mode-btn:hover {");
+                sb.append("  background: #3498db;");
+                sb.append("  color: white;");
+                sb.append("}");
+                sb.append(".mode-btn.active {");
+                sb.append("  background: #27ae60;");
+                sb.append("  color: white;");
+                sb.append("  border-color: #27ae60;");
+                sb.append("}");
+                sb.append(".mode-desc {");
+                sb.append("  font-size: 0.85em;");
+                sb.append("  color: #7f8c8d;");
+                sb.append("  margin-top: 5px;");
+                sb.append("}");
+                sb.append(".current-mode {");
+                sb.append("  background: #e8f8f5;");
+                sb.append("  padding: 10px 15px;");
+                sb.append("  border-radius: 8px;");
+                sb.append("  border-left: 4px solid #27ae60;");
+                sb.append("  margin: 15px 0;");
+                sb.append("}");
+                sb.append(".instance-list {");
+                sb.append("  margin-top: 15px;");
+                sb.append("}");
+                sb.append(".instance-item {");
+                sb.append("  background: #f8f9fa;");
+                sb.append("  padding: 10px 15px;");
+                sb.append("  border-radius: 8px;");
+                sb.append("  margin: 8px 0;");
+                sb.append("  border-left: 4px solid #3498db;");
+                sb.append("  display: flex;");
+                sb.append("  justify-content: space-between;");
+                sb.append("  align-items: center;");
+                sb.append("}");
+                sb.append(".instance-item.current {");
+                sb.append("  border-left-color: #27ae60;");
+                sb.append("  background: #e8f8f5;");
+                sb.append("}");
+                sb.append(".instance-item .port {");
+                sb.append("  font-weight: bold;");
+                sb.append("  color: #3498db;");
+                sb.append("  font-size: 1.2em;");
+                sb.append("}");
+                sb.append(".instance-item.current .port {");
+                sb.append("  color: #27ae60;");
+                sb.append("}");
+                sb.append("</style>");
+                sb.append("</head>");
+                sb.append("<body>");
+                sb.append("<div class='container'>");
+                sb.append("<h1>📦 wxcode </h1>");
 
-                    // // 动态实例列表区域（通过 JavaScript 加载）
-                    // sb.append("<h2>📋 所有已启动实例</h2>");
-                    // sb.append("<div id='instance-list' class='instance-list'>");
-                    // sb.append("<p style='color:#666;'>正在加载实例列表...</p>");
-                    // sb.append("</div>");
-                    // sb.append("<script>");
-                    // sb.append("fetch('/instances').then(r => r.json()).then(data => {");
-                    // sb.append("  const list = document.getElementById('instance-list');");
-                    // sb.append("  if (data.count === 0) {");
-                    // sb.append("    list.innerHTML = '<p style=\"color:#e74c3c;\">⚠️ 注册表为空，可能原因：</p><ul><li>微信刚启动，尚未写入注册表</li><li>注册表文件不存在或无法访问</li></ul><p>请刷新页面重试，或检查日志。</p>';");
-                    // sb.append("    return;");
-                    // sb.append("  }");
-                    // sb.append("  let html = '<p>共检测到 <strong>' + data.count + '</strong> 个已启动的微信实例：</p>';");
-                    // sb.append("  data.instances.forEach(inst => {");
-                    // sb.append("    const isCurrent = inst.packageName === data.current && inst.userId === data.currentUserId;");
-                    // sb.append("    html += '<div class=\"instance-item' + (isCurrent ? ' current' : '') + '\">';");
-                    // sb.append("    html += '<span><code>' + inst.packageName + '</code> (User ' + inst.userId + ') | 版本 ' + inst.version + '</span>';");
-                    // sb.append("    html += '<span class=\"port\">端口 ' + inst.port + '</span>';");
-                    // sb.append("    html += '</div>';");
-                    // sb.append("  });");
-                    // sb.append("  html += '<p style=\"color:#666;font-size:0.85em;\">注册表文件: ' + (data.registryFile || '未知') + '</p>';");
-                    // sb.append("  list.innerHTML = html;");
-                    // sb.append("}).catch(e => {");
-                    // sb.append("  document.getElementById('instance-list').innerHTML = '<p style=\"color:#e74c3c;\">❌ 加载失败: ' + e + '</p><p>请检查 HTTP 服务是否正常运行。</p>';");
-                    // sb.append("});");
-                    // sb.append("</script>");
+                sb.append("<h2>📦 当前实例信息</h2>");
+                sb.append("<p><strong>包名：</strong> <code>").append(outer.currentPackageName).append("</code></p>");
+                sb.append("<p><strong>User ID：</strong> <code>").append(String.valueOf(outer.currentUserId)).append("</code> <small style='color:#666;'>（用于区分系统级分身）</small></p>");
+                sb.append("<p><strong>HTTP端口：</strong> <code>").append(String.valueOf(outer.httpPort)).append("</code></p>");
+                sb.append("<p><strong>微信版本：</strong> <code>").append(outer.versionName).append("</code></p>");
 
-                    sb.append("<h2>📦 当前实例信息</h2>");
-                    sb.append("<p><strong>包名：</strong> <code>").append(this.this$0.currentPackageName).append("</code></p>");
-                    sb.append("<p><strong>User ID：</strong> <code>").append(this.this$0.currentUserId).append("</code> <small style='color:#666;'>（用于区分系统级分身）</small></p>");
-                    sb.append("<p><strong>HTTP端口：</strong> <code>").append(this.this$0.httpPort).append("</code></p>");
-                    sb.append("<p><strong>微信版本：</strong> <code>").append(this.this$0.versionName).append("</code></p>");
+                sb.append("<h2>⚙️ 执行模式配置</h2>");
+                sb.append("<div class='current-mode'>");
+                sb.append("<strong>当前模式：</strong> <code>").append(outer.currentMode).append("</code>");
+                sb.append("</div>");
+                sb.append("<p>选择登录请求的执行方式（后台运行稳定性）：</p>");
+                sb.append("<div style='text-align: center; margin: 20px 0;'>");
+                sb.append("<a class='mode-btn ").append(outer.currentMode.equals("foreground_service") ? "active" : "").append("' href='/config?mode=foreground_service'>前台服务保活</a>");
+                sb.append("<div class='mode-desc'>进程优先级最高，最稳定</div>");
+                sb.append("<a class='mode-btn ").append(outer.currentMode.equals("worker_thread") ? "active" : "").append("' href='/config?mode=worker_thread'>子线程轮询</a>");
+                sb.append("<div class='mode-desc'>默认模式，平衡性能与稳定性</div>");
+                sb.append("<a class='mode-btn ").append(outer.currentMode.equals("temp_wakeup") ? "active" : "").append("' href='/config?mode=temp_wakeup'>临时唤醒</a>");
+                sb.append("<div class='mode-desc'>最省电，但可能不稳定</div>");
+                sb.append("</div>");
+                sb.append("<p>💡 提示：切换模式后立即生效，配置会保存到 SharedPreferences</p>");
 
-                    // 执行模式配置区域
-                    sb.append("<h2>⚙️ 执行模式配置</h2>");
-                    sb.append("<div class='current-mode'>");
-                    sb.append("<strong>当前模式：</strong> <code>").append(this.this$0.currentMode).append("</code>");
-                    sb.append("</div>");
-                    sb.append("<p>选择登录请求的执行方式（后台运行稳定性）：</p>");
-                    sb.append("<div style='text-align: center; margin: 20px 0;'>");
-                    // 前台服务模式按钮
-                    sb.append("<a class='mode-btn ").append(this.this$0.currentMode.equals("foreground_service") ? "active" : "").append("' href='/config?mode=foreground_service'>前台服务保活</a>");
-                    sb.append("<div class='mode-desc'>进程优先级最高，最稳定</div>");
-                    // 子线程模式按钮
-                    sb.append("<a class='mode-btn ").append(this.this$0.currentMode.equals("worker_thread") ? "active" : "").append("' href='/config?mode=worker_thread'>子线程轮询</a>");
-                    sb.append("<div class='mode-desc'>默认模式，平衡性能与稳定性</div>");
-                    // 临时唤醒模式按钮
-                    sb.append("<a class='mode-btn ").append(this.this$0.currentMode.equals("temp_wakeup") ? "active" : "").append("' href='/config?mode=temp_wakeup'>临时唤醒</a>");
-                    sb.append("<div class='mode-desc'>最省电，但可能不稳定</div>");
-                    sb.append("</div>");
-                    sb.append("<p>💡 提示：切换模式后立即生效，配置会保存到 SharedPreferences</p>");
-
-                    sb.append("<h2>📖 API接口说明</h2>");
-                    sb.append("<table>");
-                    sb.append("<thead><tr><th>接口</th><th>说明</th><th>示例</th></tr></thead>");
-                    sb.append("<tbody>");
-                    sb.append("<tr><td><code>/whoami</code></td><td>返回当前实例信息(JSON)</td><td><a href='/whoami'>点击查看</a></td></tr>");
-                    sb.append("<tr><td><code>/instances</code></td><td>返回端口映射表(JSON)</td><td><a href='/instances'>点击查看</a></td></tr>");
-                    sb.append("<tr><td><code>/config</code></td><td>查看/配置执行模式</td><td><a href='/config'>点击查看</a></td></tr>");
-                    sb.append("<tr><td><code>/login</code></td><td>执行登录获取code</td><td><a href='/login?appId=wxaa3a999db5d744c6'>点击测试</a></td></tr>");
-                    sb.append("</tbody></table>");
-                    sb.append("<h2>💡 分身端口映射</h2>");
-                    sb.append("<p>端口计算公式：<code>基础端口(8088) + User ID偏移 + 包名后缀偏移</code></p>");
-                    sb.append("<table>");
-                    sb.append("<thead><tr><th>类型</th><th>标识</th><th>端口</th></tr></thead>");
-                    sb.append("<tbody>");
-                    sb.append("<tr><td>主用户微信</td><td><code>com.tencent.mm (User 0)</code></td><td>8088</td></tr>");
-                    sb.append("<tr><td>系统分身</td><td><code>com.tencent.mm (User 999)</code></td><td>8199 (8088+999%100+100)</td></tr>");
-                    sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm:dual</code></td><td>8089</td></tr>");
-                    sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm:clone</code></td><td>8090</td></tr>");
-                    sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm_1</code></td><td>8091</td></tr>");
-                    sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm_2</code></td><td>8092</td></tr>");
-                    sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm_xiaomi</code></td><td>8093</td></tr>");
-                    sb.append("<tr><td>其他分身</td><td><code>动态计算</code></td><td>8096-9000</td></tr>");
-                    sb.append("</tbody></table>");
-                    sb.append("<p>💡 提示：访问 <a href='/whoami'>/whoami</a> 可确认当前实例信息，访问 <a href='/instances'>/instances</a> 可查看所有实例</p>");
-                    sb.append("<h2>📋 适配版本列表</h2>");
-                    sb.append("<table>");
-                    sb.append("<thead>");
+                sb.append("<h2>📖 API接口说明</h2>");
+                sb.append("<table>");
+                sb.append("<thead><tr><th>接口</th><th>说明</th><th>示例</th></tr></thead>");
+                sb.append("<tbody>");
+                sb.append("<tr><td><code>/whoami</code></td><td>返回当前实例信息(JSON)</td><td><a href='/whoami'>点击查看</a></td></tr>");
+                sb.append("<tr><td><code>/instances</code></td><td>返回端口映射表(JSON)</td><td><a href='/instances'>点击查看</a></td></tr>");
+                sb.append("<tr><td><code>/config</code></td><td>查看/配置执行模式</td><td><a href='/config'>点击查看</a></td></tr>");
+                sb.append("<tr><td><code>/login</code></td><td>执行登录获取code</td><td><a href='/login?appId=wxaa3a999db5d744c6'>点击测试</a></td></tr>");
+                sb.append("</tbody></table>");
+                sb.append("<h2>💡 分身端口映射</h2>");
+                sb.append("<p>端口计算公式：<code>基础端口(8088) + User ID偏移 + 包名后缀偏移</code></p>");
+                sb.append("<p><code>大于100的userId: (8200+999%100)</code></p>");
+                sb.append("<table>");
+                sb.append("<thead><tr><th>类型</th><th>标识</th><th>端口</th></tr></thead>");
+                sb.append("<tbody>");
+                sb.append("<tr><td>主用户微信</td><td><code>com.tencent.mm (User 0)</code></td><td>8088</td></tr>");
+                sb.append("<tr><td>系统分身</td><td><code>com.tencent.mm (User 999)</code></td><td>8299</td></tr>");
+                sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm:dual</code></td><td>8089</td></tr>");
+                sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm:clone</code></td><td>8090</td></tr>");
+                sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm_1</code></td><td>8091</td></tr>");
+                sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm_2</code></td><td>8092</td></tr>");
+                sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm_xiaomi</code></td><td>8093</td></tr>");
+                sb.append("<tr><td>其他分身</td><td><code>动态计算</code></td><td>8096-9000</td></tr>");
+                sb.append("</tbody></table>");
+                sb.append("<p>💡 提示：访问 <a href='/whoami'>/whoami</a> 可确认当前实例信息，访问 <a href='/instances'>/instances</a> 可查看所有实例</p>");
+                sb.append("<h2>📋 适配版本列表</h2>");
+                sb.append("<table>");
+                sb.append("<thead>");
+                sb.append("<tr>");
+                sb.append("<th>版本号</th>");
+                sb.append("<th>j1 参数</th>");
+                sb.append("<th>c 参数</th>");
+                sb.append("</tr>");
+                sb.append("</thead>");
+                sb.append("<tbody>");
+                Iterator<String> itKeys = jSONObject.keys();
+                while (itKeys.hasNext()) {
+                    String next = itKeys.next();
+                    JSONObject jSONObject2 = jSONObject.getJSONObject(next);
+                    String string = jSONObject2.getString("j1");
+                    String string2 = jSONObject2.getString("c");
                     sb.append("<tr>");
-                    sb.append("<th>版本号</th>");
-                    sb.append("<th>j1 参数</th>");
-                    sb.append("<th>c 参数</th>");
+                    sb.append("<td class='version'>").append(next).append("</td>");
+                    sb.append("<td class='code'>").append(string).append("</td>");
+                    sb.append("<td class='code'>").append(string2).append("</td>");
                     sb.append("</tr>");
-                    sb.append("</thead>");
-                    sb.append("<tbody>");
-                    Iterator<String> itKeys = jSONObject.keys();
-                    while (itKeys.hasNext()) {
-                        String next = itKeys.next();
-                        JSONObject jSONObject2 = jSONObject.getJSONObject(next);
-                        String string = jSONObject2.getString("j1");
-                        String string2 = jSONObject2.getString("c");
-                        sb.append("<tr>");
-                        sb.append("<td class='version'>").append(next).append("</td>");
-                        sb.append("<td class='code'>").append(string).append("</td>");
-                        sb.append("<td class='code'>").append(string2).append("</td>");
-                        sb.append("</tr>");
-                    }
-                    sb.append("</tbody>");
-                    sb.append("</table>");
-                    sb.append("<div class='footer'>");
-                    sb.append("© 2026 wxcode 插件 | 服务器时间：").append(LocalDateTime.now()).append("");
-                    sb.append("</div>");
-                    sb.append("</div>");
-                    sb.append("</body>");
-                    sb.append("</html>");
-                    return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, NanoHTTPD.MIME_HTML, sb.toString());
-                } catch (Exception e) {
-                    e.printStackTrace();
-                    return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, NanoHTTPD.MIME_PLAINTEXT, "服务器内部错误");
                 }
+                sb.append("</tbody>");
+                sb.append("</table>");
+                sb.append("<div class='footer'>");
+                sb.append("© 2026 wxcode 插件 | 服务器时间：").append(LocalDateTime.now()).append("");
+                sb.append("</div>");
+                sb.append("</div>");
+                sb.append("</body>");
+                sb.append("</html>");
+                return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, NanoHTTPD.MIME_HTML, sb.toString());
+            } catch (Exception e) {
+                e.printStackTrace();
+                return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, NanoHTTPD.MIME_PLAINTEXT, "服务器内部错误");
+            }
         }
     }
 }
