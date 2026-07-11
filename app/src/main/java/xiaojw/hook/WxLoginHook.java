@@ -17,6 +17,9 @@ import android.os.Looper;
 import android.os.PowerManager;
 import android.app.ActivityManager;
 import android.app.Application;
+import android.app.AlarmManager;
+import android.app.PendingIntent;
+import android.os.SystemClock;
 import android.os.UserHandle;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -54,6 +57,8 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     // static 标志：供 KeepAliveService（static 内部类）上报"已真正 startForeground 完成"。
     // 仅当它为 true 时，Android 10 的"有前台Service可后台启动Activity"豁免才成立。
     private static volatile boolean fgServiceActive = false;
+    // 省电模式：true=AlarmManager 定时唤醒(省电但响应有延迟)，false=常驻 WakeLock(即时响应)
+    private static volatile boolean powerSaverMode = false;
     private Application wechatApplication;
     private Activity fakeTopActivity;
     private ClassLoader savedClassLoader;
@@ -78,10 +83,10 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private String c = "he0.c";
     private String a1 = "com.tencent.mm.plugin.appbrand.jsapi.auth.h2";
     private String a7 = "com.tencent.mm.plugin.appbrand.jsapi.auth.l2";
-    private String versionName = "000";
-    private String currentPackageName = "";
-    private int currentUserId = 0;
-    private int httpPort = 8088;
+    private static volatile String versionName = "000";
+    private static volatile String currentPackageName = "";
+    private static volatile int currentUserId = 0;
+    private static volatile int httpPort = 8088;
     // 主端口：所有分身实例向该端口(用户0的8088)发送注册通知，由其汇总所有启动的端口
     private static final int MASTER_PORT = 8088;
     // 前台保活 Service 通知ID与渠道ID（真正提升进程优先级，避免后台网络限流）
@@ -89,8 +94,8 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private static final String FOREGROUND_CHANNEL_ID = "wxcode_foreground_keepalive";
 
     // 内存实例表：跨用户实例通过向主端口注册通知汇聚，无需共享文件系统即可多用户共享
-    private final Object instanceLock = new Object();
-    private final java.util.Map<String, JSONObject> instanceMap = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final Object instanceLock = new Object();
+    private static final java.util.Map<String, JSONObject> instanceMap = new java.util.concurrent.ConcurrentHashMap<>();
     private Thread heartbeatThread;
 
     /**
@@ -158,7 +163,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     /**
      * 将实例注册到内存实例表（跨用户共享的主要数据源，无需共享文件系统）
      */
-    private void registerInstanceInMemory(String packageName, int userId, int port, String version) {
+    private static void registerInstanceInMemory(String packageName, int userId, int port, String version) {
         try {
             String key = packageName + "_" + userId;
             JSONObject item = new JSONObject();
@@ -204,7 +209,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     /**
      * 非主端口实例：向主端口(8088)发送注册通知
      */
-    private void notifyMasterRegister(int port, int userId, String version) {
+    private static void notifyMasterRegister(int port, int userId, String version) {
         new Thread(() -> {
             HttpURLConnection conn = null;
             try {
@@ -251,6 +256,19 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
+     * 执行一次心跳续期（供 AlarmManager 省电模式回调使用）。
+     * 主端口刷新自己的 registerTime，非主端口向主端口重新注册。
+     */
+    private static void performHeartbeat() {
+        if (httpPort == MASTER_PORT) {
+            registerInstanceInMemory(currentPackageName, currentUserId, httpPort, versionName);
+        } else {
+            notifyMasterRegister(httpPort, currentUserId, versionName);
+        }
+        XposedBridge.log(TAG + " AlarmManager 心跳续期完成");
+    }
+
+    /**
      * 非主端口实例：从主端口拉取汇总后的实例列表
      */
     private JSONArray fetchMasterInstances() {
@@ -284,6 +302,12 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         if (context instanceof Application) this.wechatApplication = (Application) context;
         hookActivityLifecycle();
         startWorkerThread();
+        // 读取持久化的保活模式，确保微信重启后用户上次选择不丢失
+        try {
+            powerSaverMode = appContext.getSharedPreferences("wxcode_config", Context.MODE_PRIVATE)
+                    .getBoolean("power_saver_mode", false);
+            XposedBridge.log(TAG + " 保活模式: " + (powerSaverMode ? "省电模式" : "性能模式"));
+        } catch (Exception ignored) {}
         // 进程级常驻：HTTP server 启动即拉起前台 Service，确保所有 HTTP 线程
         // （含 NanoHTTPD accept）始终受前台优先级保护，不被 Doze 限流。
         startForegroundService();
@@ -434,6 +458,24 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             appContext.stopService(new Intent(appContext, KeepAliveService.class));
         } catch (Exception ignored) {}
         isForegroundServiceRunning = false;
+    }
+
+    /**
+     * 切换保活模式：更新标志 + 重启 KeepAliveService 以应用新模式
+     */
+    private void switchPowerMode(boolean toPowerSaver) {
+        if (powerSaverMode == toPowerSaver) return;
+        powerSaverMode = toPowerSaver;
+        // 持久化到 SharedPreferences，确保微信重启后模式选择不丢失
+        try {
+            appContext.getSharedPreferences("wxcode_config", Context.MODE_PRIVATE)
+                    .edit().putBoolean("power_saver_mode", toPowerSaver).apply();
+        } catch (Exception ignored) {}
+        XposedBridge.log(TAG + " 切换保活模式: " + (toPowerSaver ? "省电模式" : "性能模式"));
+        stopForegroundService();
+        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        isForegroundServiceRunning = false;
+        startForegroundService();
     }
 
     /**
@@ -874,6 +916,22 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 }
             }
 
+            // /config 接口：查看/切换保活模式
+            if (uri.equals("/config")) {
+                String mode = iHTTPSession.getParms().getOrDefault("mode", "");
+                if ("performance".equals(mode) || "power_saver".equals(mode)) {
+                    outer.switchPowerMode("power_saver".equals(mode));
+                }
+                try {
+                    JSONObject cfg = new JSONObject();
+                    cfg.put("mode", powerSaverMode ? "power_saver" : "performance");
+                    cfg.put("modeDesc", powerSaverMode ? "省电模式(AlarmManager定时唤醒)" : "性能模式(常驻WakeLock)");
+                    return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", cfg.toString());
+                } catch (Exception e) {
+                    return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "application/json", "{\"err\":-500,\"msg\":\"" + e.getMessage() + "\"}");
+                }
+            }
+
             // /login 接口：执行登录
             if (uri.equals("/login")) {
                 return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", outer.doLogin(iHTTPSession.getParms().getOrDefault("appId", DEFAULT_AUTO_APP_ID), classLoader));
@@ -1083,6 +1141,16 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 sb.append("<tr><td><code>/instances</code></td><td>返回端口映射表(JSON)</td><td><a href='/instances'>点击查看</a></td></tr>");
                 sb.append("<tr><td><code>/login</code></td><td>执行登录获取code</td><td><a href='/login?appId=wxaa3a999db5d744c6'>点击测试</a></td></tr>");
                 sb.append("</tbody></table>");
+                sb.append("<h2>⚡ 保活模式切换</h2>");
+                sb.append("<p>当前模式：<strong id='currentMode'>加载中...</strong></p>");
+                sb.append("<div style='display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px'>");
+                sb.append("<button onclick='switchMode(\"performance\")' style='padding:10px 20px;font-size:14px;cursor:pointer;background:#4CAF50;color:#fff;border:none;border-radius:6px'>⚡ 性能模式（即时响应，耗电3-9%/天）</button>");
+                sb.append("<button onclick='switchMode(\"power_saver\")' style='padding:10px 20px;font-size:14px;cursor:pointer;background:#2196F3;color:#fff;border:none;border-radius:6px'>🔋 省电模式（定时唤醒，耗电0.1%/天，响应延迟2-9分钟）</button>");
+                sb.append("</div>");
+                sb.append("<script>");
+                sb.append("fetch('/config').then(r=>r.json()).then(d=>{document.getElementById('currentMode').textContent=d.modeDesc;});");
+                sb.append("function switchMode(m){fetch('/config?mode='+m).then(r=>r.json()).then(d=>{alert('已切换：'+d.modeDesc);location.reload();});}");
+                sb.append("</script>");
                 sb.append("<h2>💡 分身端口映射</h2>");
                 sb.append("<p>端口计算公式：<code>基础端口(8088) + User ID偏移</code></p>");
                 sb.append("<p><code>User ID &gt; 100 时: 8200 + (User ID % 100)</code></p>");
@@ -1160,6 +1228,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      */
     public static class KeepAliveService extends Service {
         private PowerManager.WakeLock serviceWakeLock;
+        private static final int ALARM_INTERVAL_MS = 2 * 60 * 1000;
+        private static final String EXTRA_ALARM_TRIGGER = "alarm_trigger";
+        private static PendingIntent alarmPendingIntent;
 
         @Override
         public void onCreate() {
@@ -1168,7 +1239,20 @@ public class WxLoginHook implements IXposedHookLoadPackage {
 
         @Override
         public int onStartCommand(Intent intent, int flags, int startId) {
-            // 立即调用 startForeground，否则系统会抛出 ForegroundServiceDidNotStartInTimeException
+            boolean isAlarmTrigger = intent != null && intent.getBooleanExtra(EXTRA_ALARM_TRIGGER, false);
+            if (isAlarmTrigger) {
+                // 闹钟触发：acquire 短时 wakeLock(10s 自动释放)，执行心跳续期 + 重新注册闹钟
+                // 不 stopSelf：保持 Service 前台运行，进程优先级不降，只是 CPU 休眠省电
+                try {
+                    PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                    PowerManager.WakeLock alarmWl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wxcode:alarm_heartbeat");
+                    alarmWl.acquire(10000);
+                    performHeartbeat();
+                    scheduleNextAlarm();
+                } catch (Throwable ignored) {}
+                return START_STICKY;
+            }
+            // 正常启动：startForeground + 根据模式选择保活策略
             NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 NotificationChannel channel = new NotificationChannel(
@@ -1179,7 +1263,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             }
             Notification notification = new Notification.Builder(this)
                     .setContentTitle("wxcode 服务运行中")
-                    .setContentText("后台保活中，避免接口请求被限流")
+                    .setContentText(powerSaverMode ? "省电模式：定时唤醒保活" : "性能模式：常驻保活中")
                     .setSmallIcon(android.R.drawable.ic_dialog_info)
                     .setPriority(Notification.PRIORITY_LOW)
                     .setOngoing(true)
@@ -1188,31 +1272,61 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             try {
                 startForeground(FOREGROUND_NOTIF_ID, notification);
                 fgServiceActive = true;
-                // 常驻 WakeLock（无超时）：保持 CPU 唤醒，确保 HTTP server 线程随时可调度。
-                // 与 Service 生命周期绑定，onDestroy 中释放。根治长时间空闲后 HTTP 无响应。
-                if (serviceWakeLock == null || !serviceWakeLock.isHeld()) {
-                    PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-                    serviceWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wxcode:keepalive");
-                    serviceWakeLock.acquire();
+                cancelAlarm();
+                if (powerSaverMode) {
+                    // 省电模式：AlarmManager 每 2 分钟唤醒一次，不持有常驻 WakeLock
+                    scheduleNextAlarm();
+                    XposedBridge.log(TAG + " KeepAliveService 省电模式：AlarmManager 定时唤醒(间隔" + ALARM_INTERVAL_MS / 1000 + "s)");
+                } else {
+                    // 性能模式：常驻 WakeLock，CPU 始终可调度，HTTP 即时响应
+                    if (serviceWakeLock == null || !serviceWakeLock.isHeld()) {
+                        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                        serviceWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wxcode:keepalive");
+                        serviceWakeLock.acquire();
+                    }
+                    XposedBridge.log(TAG + " KeepAliveService 性能模式：WakeLock 常驻持有");
                 }
-                XposedBridge.log(TAG + " KeepAliveService 已 startForeground，WakeLock 常驻持有");
             } catch (Throwable e) {
                 fgServiceActive = false;
                 XposedBridge.log(TAG + " KeepAliveService.startForeground 失败[" + e.getClass().getSimpleName() + "]:" + e.getMessage());
             }
-            // START_STICKY：被系统回收后尽量重建，保持后台可靠性
             return START_STICKY;
+        }
+
+        private void scheduleNextAlarm() {
+            AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            Intent intent = new Intent(this, KeepAliveService.class);
+            intent.putExtra(EXTRA_ALARM_TRIGGER, true);
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) flags |= PendingIntent.FLAG_IMMUTABLE;
+            alarmPendingIntent = PendingIntent.getService(this, 1002, intent, flags);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        SystemClock.elapsedRealtime() + ALARM_INTERVAL_MS, alarmPendingIntent);
+            } else {
+                am.set(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        SystemClock.elapsedRealtime() + ALARM_INTERVAL_MS, alarmPendingIntent);
+            }
+        }
+
+        private void cancelAlarm() {
+            if (alarmPendingIntent != null) {
+                AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+                am.cancel(alarmPendingIntent);
+                alarmPendingIntent = null;
+            }
         }
 
         @Override
         public void onDestroy() {
             fgServiceActive = false;
+            cancelAlarm();
             if (serviceWakeLock != null && serviceWakeLock.isHeld()) {
                 try { serviceWakeLock.release(); } catch (Exception ignored) {}
             }
             serviceWakeLock = null;
             super.onDestroy();
-            XposedBridge.log(TAG + " KeepAliveService 已销毁，WakeLock 已释放");
+            XposedBridge.log(TAG + " KeepAliveService 已销毁");
         }
 
 
