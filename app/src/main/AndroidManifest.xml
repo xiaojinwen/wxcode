@@ -3,6 +3,10 @@
     <!-- Xposed module metadata -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <!-- 启动前台 Service 必需（Android 9+），否则 startForegroundService 抛 SecurityException，前台Service起不来导致灭屏Doze限流 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <!-- Android 14+ 对 dataSync 类型前台Service要求该权限 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     
     <application
         android:label="wxcode"

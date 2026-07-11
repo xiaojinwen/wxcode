@@ -10,8 +10,8 @@ android {
         applicationId 'xiaojw.wxcode'
         minSdk 17
         targetSdk 33
-        versionCode 3
-        versionName '2.0.1'
+        versionCode 4
+        versionName '2.0.2'
     }
 
     buildTypes {

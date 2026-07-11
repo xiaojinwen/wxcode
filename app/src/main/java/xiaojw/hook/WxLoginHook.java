@@ -51,6 +51,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private static final String MODE_WORKER_THREAD = "worker_thread";
     private static final String MODE_TEMP_WAKEUP = "temp_wakeup";
 
+
     private LoginHttpServer httpServer;
     private boolean isLoginInFlight = false;
     private Context appContext;
@@ -59,26 +60,35 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private HandlerThread workerThread;
     private Handler workerHandler;
     private boolean isForegroundServiceRunning = false;
+    // static 标志：供 KeepAliveService（static 内部类）上报"已真正 startForeground 完成"。
+    // 仅当它为 true 时，Android 10 的"有前台Service可后台启动Activity"豁免才成立。
+    private static volatile boolean fgServiceActive = false;
     private boolean tempForegroundStarted = false; // 标记本次登录是否临时拉起前台Service，用于登录后释放
     private PowerManager.WakeLock wakeLock;
     private Application wechatApplication;
     private Activity fakeTopActivity;
     private ClassLoader savedClassLoader;
     private boolean wasForegroundBeforeLogin = false;
+    private Activity tempWakedActivity = null; // 记录本次登录临时拉起的微信Activity，用于登录后退回后台
 
     // 版本配置JSON
+    // a1 = 1参回调(o2)实现类，构造: (LoginTask)；a7 = 2参回调(h80/j)实现类，构造: (LoginTask, o2)
+    // 8.0.76 起 h2/l2 混淆位移：h2->i2(a1)、l2->m2(a7)，构造函数签名随版本变化，故均纳入配置
     private String jsonString = """
         {
-            "8.0.49": {"j1": "u70.k1", "c": "o60.c"},
-            "8.0.62": {"j1": "of0.j1", "c": "he0.c"},
-            "8.0.70": {"j1": "yj0.j1", "c": "ti0.c"},
-            "8.0.71": {"j1": "tk0.j1", "c": "oj0.c"},
-            "8.0.72": {"j1": "dl0.k1", "c": "yj0.c"},
-            "8.0.74": {"j1": "gm0.j1", "c": "bl0.c"}
+            "8.0.49": {"j1": "u70.k1", "c": "o60.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
+            "8.0.62": {"j1": "of0.j1", "c": "he0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
+            "8.0.70": {"j1": "yj0.j1", "c": "ti0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
+            "8.0.71": {"j1": "tk0.j1", "c": "oj0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
+            "8.0.72": {"j1": "dl0.k1", "c": "yj0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
+            "8.0.74": {"j1": "gm0.j1", "c": "bl0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
+            "8.0.76": {"j1": "hm0.j1", "c": "ccl0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.i2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.m2"}
         }""";
 
     private String j1 = "of0.j1";
     private String c = "he0.c";
+    private String a1 = "com.tencent.mm.plugin.appbrand.jsapi.auth.h2";
+    private String a7 = "com.tencent.mm.plugin.appbrand.jsapi.auth.l2";
     private String versionName = "000";
     private String currentPackageName = "";
     private int currentUserId = 0;
@@ -279,7 +289,15 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         this.appContext = context;
         if (context instanceof Application) this.wechatApplication = (Application) context;
         this.prefs = context.getSharedPreferences("wxcode_config", Context.MODE_PRIVATE);
-        this.currentMode = prefs.getString("exec_mode", MODE_WORKER_THREAD);
+        String savedMode = prefs.getString("exec_mode", MODE_WORKER_THREAD);
+        // 兼容旧版持久化值（如已删除的 aggressive 模式），非法模式回退到默认并清理
+        if (!MODE_FOREGROUND_SERVICE.equals(savedMode)
+                && !MODE_WORKER_THREAD.equals(savedMode)
+                && !MODE_TEMP_WAKEUP.equals(savedMode)) {
+            savedMode = MODE_WORKER_THREAD;
+            prefs.edit().putString("exec_mode", savedMode).apply();
+        }
+        this.currentMode = savedMode;
         XposedBridge.log(TAG + " [" + currentPackageName + "] 当前执行模式: " + currentMode);
         hookActivityLifecycle();
         applyExecutionMode();
@@ -440,7 +458,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             isForegroundServiceRunning = true;
             XposedBridge.log(TAG + " 前台保活Service已启动（进程优先级提升至前台）");
         } catch (Exception e) {
-            XposedBridge.log(TAG + " 前台Service启动失败:" + e.getMessage());
+            // 常见原因：未声明 FOREGROUND_SERVICE 权限导致 SecurityException，前台Service起不来→灭屏Doze限流
+            XposedBridge.log(TAG + " 前台Service启动失败[" + e.getClass().getSimpleName() + "]:" + e.getMessage());
+            isForegroundServiceRunning = false;
             if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
             wakeLock = null;
             startWorkerThread();
@@ -472,6 +492,19 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             tempForegroundStarted = true;
         }
     }
+
+    /**
+     * 等待前台 Service 真正 startForeground 完成（startForegroundService 是异步的）。
+     * 只有真正就绪（fgServiceActive=true）后，Android 10 才允许从后台启动 Activity。
+     */
+    private void waitForForegroundService(long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (!fgServiceActive && System.currentTimeMillis() < deadline) {
+            try { Thread.sleep(50); } catch (InterruptedException ignored) { break; }
+        }
+    }
+
+
 
     /**
      * 启动后台轮询子线程
@@ -516,7 +549,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      */
     private void updateExecutionMode(String newMode) {
         if (newMode.equals(currentMode)) return;
+        // 切换前释放旧模式的专属资源，避免泄漏/常驻
         if (MODE_WORKER_THREAD.equals(currentMode)) stopWorkerThread();
+        if (MODE_FOREGROUND_SERVICE.equals(currentMode) && isForegroundServiceRunning) stopForegroundService();
         String old = currentMode;
         currentMode = newMode;
         prefs.edit().putString("exec_mode", newMode).apply();
@@ -565,7 +600,10 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     JSONObject verCfg = new JSONObject(jsonString).getJSONObject(versionName);
                     j1 = verCfg.getString("j1");
                     c = verCfg.getString("c");
-                    XposedBridge.log(TAG + " 版本配置加载成功: " + verCfg);
+                    a1 = verCfg.optString("a1", a1);
+                    a7 = verCfg.optString("a7", a7);
+                    XposedBridge.log(TAG + " 版本配置加载成功: " + verCfg
+                            + " [a1=" + a1 + ", a7=" + a7 + "]");
                 } catch (Exception e) {
                     XposedBridge.log(TAG + " 版本配置不存在: " + e.getMessage());
                 }
@@ -599,18 +637,33 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         final String[] res = {null};
         PowerManager.WakeLock tempWakeLock = null;
         try {
+            // 后台登录超时
+            final long timeoutMs = 30000;
+            XposedBridge.log(TAG + " doLogin 模式=" + currentMode + " 前台Service运行=" + isForegroundServiceRunning + " 超时=" + timeoutMs + "ms");
             Class<?> LoginTaskCls = XposedHelpers.findClass("com.tencent.mm.plugin.appbrand.jsapi.auth.JsApiLogin$LoginTask", classLoader);
-            Class<?> h2Cls = XposedHelpers.findClass("com.tencent.mm.plugin.appbrand.jsapi.auth.h2", classLoader);
-            Class<?> l2Cls = XposedHelpers.findClass("com.tencent.mm.plugin.appbrand.jsapi.auth.l2", classLoader);
+            Class<?> h2Cls = XposedHelpers.findClass(this.a1, classLoader);
+            Class<?> l2Cls = XposedHelpers.findClass(this.a7, classLoader);
             Class<?> cCls = XposedHelpers.findClass(this.c, classLoader);
             Class<?> j1Cls = XposedHelpers.findClass(this.j1, classLoader);
+            XposedBridge.log(TAG + " a1=" + this.a1 + " a7=" + this.a7);
             XposedBridge.log(TAG + " 发起登录 appId=" + str);
-            boolean needWake = !isWeChatForeground();
-            if (needWake) {
-                // 后台态：Android 10+ 禁止后台启动Activity，故用前台Service提升进程优先级，
-                // 真正解决后台接口请求被系统限流/卡住的问题；tempWakeupWeChat 仅作尽力而为的兜底。
+            // 仅看微信是否真有前台 Activity（fakeTopActivity）。不能依赖 isWeChatForeground()，
+            // 因为前台 Service 会抬高进程 importance 让其返回 true，从而错误跳过拉起，导致微信仍后台限速卡住。
+            boolean weChatHasForegroundActivity = fakeTopActivity != null && !fakeTopActivity.isFinishing();
+            wasForegroundBeforeLogin = weChatHasForegroundActivity;
+            if (!weChatHasForegroundActivity) {
+                // 微信无前台 Activity：其内部按"后台"限速网络，必须真正拉起一个前台 Activity 才能解除限速。
+                // 先拉起前台Service，等其真正 startForeground（异步）后，Android 10 才允许从后台启动 Activity。
                 ensureForegroundForBackground();
+                waitForForegroundService(1000);
                 tempWakeupWeChat();
+                // 等微信主界面 resume，记录我们临时拉起的 Activity，供登录结束后退回后台
+                try { Thread.sleep(400); } catch (InterruptedException ignored) {}
+                if (fakeTopActivity != null && !fakeTopActivity.isFinishing()) {
+                    tempWakedActivity = fakeTopActivity;
+                }
+                XposedBridge.log(TAG + " 后台拉起微信后: fgServiceActive=" + fgServiceActive
+                        + " fakeTopActivity=" + (fakeTopActivity == null ? "null" : fakeTopActivity.getClass().getSimpleName()));
             }
             forceForegroundState(classLoader);
             Object loginTask = XposedHelpers.newInstance(LoginTaskCls);
@@ -622,7 +675,8 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             setField(loginTask, "u", 0);
             setField(loginTask, "A", 1271);
             Constructor<?> ctor = findHe0cConstructor(cCls);
-            Object h2Obj = h2Cls.getConstructor(LoginTaskCls).newInstance(loginTask);
+            Constructor<?> h2Ctor = findSingleArgConstructor(h2Cls, LoginTaskCls);
+            Object h2Obj = h2Ctor.newInstance(loginTask);
             Object l2Obj = XposedHelpers.newInstance(l2Cls, loginTask, h2Obj);
             Object cObj = ctor.newInstance(str, new LinkedList<>(), 1, "", "", 0, 1271, l2Obj);
             XposedHelpers.callMethod(XposedHelpers.callStaticMethod(j1Cls, "d"), "g", cObj);
@@ -654,10 +708,20 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                             String code = (String) getField(loginTask, "r");
                             String rawCode = (String) getField(loginTask, "q");
                             if (code == null) {
-                                if (System.currentTimeMillis() - start <= 15000) {
+                                if (System.currentTimeMillis() - start <= timeoutMs) {
                                     handler.postDelayed(this, 200);
                                     return;
                                 } else {
+                                    // 超时：探测字段可读性，区分"字段名不匹配(版本适配)"与"确实未返回"
+                                    String probe;
+                                    try {
+                                        Object r = getField(loginTask, "r");
+                                        Object q = getField(loginTask, "q");
+                                        probe = "r=" + r + ",q=" + q;
+                                    } catch (Throwable pe) {
+                                        probe = "字段读取失败[" + pe.getClass().getSimpleName() + "]:" + pe.getMessage();
+                                    }
+                                    XposedBridge.log(TAG + " 登录超时 probe:" + probe);
                                     res[0] = "{\"err\":-210,\"msg\":\"登录超时\"}";
                                     lockObj.notify();
                                     return;
@@ -668,7 +732,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                                     str, code, rawCode, type, rawCode == null ? 0 : rawCode.length());
                             lockObj.notify();
                         } catch (Throwable e) {
-                            XposedBridge.log(TAG + " 轮询异常:" + e.getMessage());
+                            XposedBridge.log(TAG + " 轮询异常[" + e.getClass().getSimpleName() + "]:" + e.getMessage());
                             handler.postDelayed(this, 200);
                         }
                     }
@@ -676,7 +740,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             };
             synchronized (lockObj) {
                 handler.post(pollTask);
-                lockObj.wait(16000);
+                lockObj.wait(timeoutMs + 1000);
             }
             if (res[0] == null) res[0] = "{\"err\":-210,\"msg\":\"登录超时\"}";
         } catch (Throwable e) {
@@ -685,6 +749,15 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         } finally {
             isLoginInFlight = false;
             restoreForegroundState();
+            // 若本次是临时把微信拉到前台，登录结束后退回后台，避免微信一直停留前台打扰用户
+            if (!wasForegroundBeforeLogin && tempWakedActivity != null) {
+                try {
+                    if (tempWakedActivity == fakeTopActivity && !tempWakedActivity.isFinishing()) {
+                        tempWakedActivity.finish();
+                    }
+                } catch (Throwable ignored) {}
+                tempWakedActivity = null;
+            }
             // 若本次登录是临时拉起的前台Service，登录结束后释放，避免长期常驻耗电
             if (tempForegroundStarted) {
                 stopForegroundService();
@@ -735,6 +808,66 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
+     * 查找 a1(原h2) 的 1参构造函数 (LoginTask)。
+     * 部分版本（如 8.0.76）构造函数签名发生混淆位移，故优先按"首参可接收 LoginTask"匹配，
+     * 匹配不到再回退到精确 (LoginTask) 签名，以兼容旧版。
+     */
+    private Constructor<?> findSingleArgConstructor(Class<?> clazz, Class<?> loginTaskCls) {
+        Constructor<?> exact = null;
+        for (Constructor<?> c : clazz.getDeclaredConstructors()) {
+            Class<?>[] pts = c.getParameterTypes();
+            if (pts.length == 1) {
+                if (pts[0].isAssignableFrom(loginTaskCls)) {
+                    c.setAccessible(true);
+                    return c;
+                }
+                if (exact == null) exact = c;
+            }
+        }
+        if (exact != null) {
+            XposedBridge.log(TAG + " [a1] 未找到精确 (LoginTask) 构造，回退单参构造: " + exact);
+            exact.setAccessible(true);
+            return exact;
+        }
+        try {
+            Constructor<?> c = clazz.getConstructor(loginTaskCls);
+            c.setAccessible(true);
+            return c;
+        } catch (NoSuchMethodException e) {
+            throw new RuntimeException("未找到 a1 单参构造函数:" + clazz.getName());
+        }
+    }
+
+    /**
+     * 计算一组字符串的最长公共前缀，并回退到最后一个 '.' 之后断开，
+     * 保证保留完整的类名段（如 com.tencent...auth.），避免在前缀中间截断。
+     */
+    private String longestCommonPrefix(java.util.List<String> strs) {
+        if (strs == null || strs.isEmpty()) return "";
+        String prefix = strs.get(0);
+        for (int i = 1; i < strs.size(); i++) {
+            String s = strs.get(i);
+            int j = 0;
+            int len = Math.min(prefix.length(), s.length());
+            while (j < len && prefix.charAt(j) == s.charAt(j)) j++;
+            prefix = prefix.substring(0, j);
+            if (prefix.isEmpty()) break;
+        }
+        int lastDot = prefix.lastIndexOf('.');
+        if (lastDot > 0) prefix = prefix.substring(0, lastDot + 1);
+        return prefix;
+    }
+
+    /**
+     * 将类名公共前缀替换为省略号，仅保留尾部不同的类名段。
+     */
+    private String shortenClass(String s, String prefix) {
+        if (s == null || prefix == null || prefix.isEmpty()) return s;
+        if (s.startsWith(prefix)) return "…" + s.substring(prefix.length());
+        return s;
+    }
+
+    /**
      * 识别code编码类型
      */
     private String classifyCode(String str) {
@@ -777,6 +910,8 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     info.put("version", outer.versionName);
                     info.put("j1", outer.j1);
                     info.put("c", outer.c);
+                    info.put("a1", outer.a1);
+                    info.put("a7", outer.a7);
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", info.toString());
                 } catch (Exception e) {
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "application/json", "{\"err\":-500,\"msg\":\"" + e.getMessage() + "\"}");
@@ -935,6 +1070,26 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 sb.append("  border-radius: 10px;");
                 sb.append("  overflow: hidden;");
                 sb.append("}");
+                sb.append(".version-scroll {");
+                sb.append("  overflow-x: auto;");
+                sb.append("  border-radius: 10px;");
+                sb.append("}");
+                sb.append(".version-scroll table th:first-child,");
+                sb.append(".version-scroll table td:first-child {");
+                sb.append("  position: sticky;");
+                sb.append("  left: 0;");
+                sb.append("  z-index: 1;");
+                sb.append("  box-shadow: 2px 0 0 rgba(0, 0, 0, 0.08);");
+                sb.append("}");
+                sb.append(".version-scroll table th:first-child {");
+                sb.append("  background: linear-gradient(to right, #3498db, #2c3e50);");
+                sb.append("}");
+                sb.append(".version-scroll table td:first-child {");
+                sb.append("  background: #ffffff;");
+                sb.append("}");
+                sb.append(".version-scroll table tr:nth-child(even) td:first-child {");
+                sb.append("  background: #f8f9fa;");
+                sb.append("}");
                 sb.append("th {");
                 sb.append("  background: linear-gradient(to right, #3498db, #2c3e50);");
                 sb.append("  color: white;");
@@ -1081,6 +1236,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 sb.append("<div class='mode-desc'>默认模式，平衡性能与稳定性</div>");
                 sb.append("<a class='mode-btn ").append(outer.currentMode.equals("temp_wakeup") ? "active" : "").append("' href='/config?mode=temp_wakeup'>临时唤醒</a>");
                 sb.append("<div class='mode-desc'>最省电，但可能不稳定</div>");
+
                 sb.append("</div>");
                 sb.append("<p>💡 提示：切换模式后立即生效，配置会保存到 SharedPreferences</p>");
 
@@ -1105,14 +1261,28 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 sb.append("</tbody></table>");
                 sb.append("<p>💡 提示：系统分身包名均为 <code>com.tencent.mm</code>。所有分身启动后向主端口(用户0的<code>8088</code>)发送注册通知，由主端口汇总所有端口；访问任意实例的 <a href='/instances'>/instances</a> 即可看到全部（主端口<code>role=master</code>，其余<code>slave</code>）。跨用户共享依赖<code>127.0.0.1</code>互通（多数系统分身满足）。</p>");
                 sb.append("<h2>📋 适配版本列表</h2>");
+                sb.append("<div class='version-scroll'>");
                 sb.append("<table>");
                 sb.append("<thead>");
                 sb.append("<tr>");
                 sb.append("<th>版本号</th>");
                 sb.append("<th>j1 参数</th>");
                 sb.append("<th>c 参数</th>");
+                sb.append("<th>a1 (h2→1参)</th>");
+                sb.append("<th>a7 (l2→2参)</th>");
                 sb.append("</tr>");
                 sb.append("</thead>");
+                // 计算所有 a1/a7 的公共前缀，展示时省略只保留尾部不同的类名段
+                java.util.List<String> classNames = new java.util.ArrayList<>();
+                Iterator<String> preIt = jSONObject.keys();
+                while (preIt.hasNext()) {
+                    JSONObject o = jSONObject.getJSONObject(preIt.next());
+                    String a = o.optString("a1", "");
+                    String b = o.optString("a7", "");
+                    if (a.contains(".")) classNames.add(a);
+                    if (b.contains(".")) classNames.add(b);
+                }
+                final String aPrefix = longestCommonPrefix(classNames);
                 sb.append("<tbody>");
                 Iterator<String> itKeys = jSONObject.keys();
                 while (itKeys.hasNext()) {
@@ -1120,14 +1290,21 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     JSONObject jSONObject2 = jSONObject.getJSONObject(next);
                     String string = jSONObject2.getString("j1");
                     String string2 = jSONObject2.getString("c");
+                    String a1Full = jSONObject2.optString("a1", "-");
+                    String a7Full = jSONObject2.optString("a7", "-");
+                    String stringA1 = shortenClass(a1Full, aPrefix);
+                    String stringA7 = shortenClass(a7Full, aPrefix);
                     sb.append("<tr>");
                     sb.append("<td class='version'>").append(next).append("</td>");
                     sb.append("<td class='code'>").append(string).append("</td>");
                     sb.append("<td class='code'>").append(string2).append("</td>");
+                    sb.append("<td class='code' title='").append(a1Full).append("'>").append(stringA1).append("</td>");
+                    sb.append("<td class='code' title='").append(a7Full).append("'>").append(stringA7).append("</td>");
                     sb.append("</tr>");
                 }
                 sb.append("</tbody>");
                 sb.append("</table>");
+                sb.append("</div>");
                 sb.append("<div class='footer'>");
                 sb.append("© 2026 wxcode 插件 | 服务器时间：").append(LocalDateTime.now()).append("");
                 sb.append("</div>");
@@ -1172,10 +1349,27 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     .setOngoing(true)
                     .setChannelId(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? FOREGROUND_CHANNEL_ID : null)
                     .build();
-            startForeground(FOREGROUND_NOTIF_ID, notification);
+            try {
+                // 缺少 FOREGROUND_SERVICE / FOREGROUND_SERVICE_DATA_SYNC 权限时这里会抛 SecurityException，
+                // 前台Service起不来→灭屏Doze仍会延迟网络。务必在Manifest声明权限。
+                startForeground(FOREGROUND_NOTIF_ID, notification);
+                // 真正 startForeground 成功，标记就绪：此后 Android 10 才允许从后台启动微信的 Activity
+                fgServiceActive = true;
+                XposedBridge.log(TAG + " KeepAliveService 已 startForeground，前台豁免就绪");
+            } catch (Throwable e) {
+                fgServiceActive = false;
+                XposedBridge.log(TAG + " KeepAliveService.startForeground 失败[" + e.getClass().getSimpleName() + "]:" + e.getMessage());
+            }
             // START_STICKY：被系统回收后尽量重建，保持后台可靠性
             return START_STICKY;
         }
+
+        @Override
+        public void onDestroy() {
+            fgServiceActive = false;
+            super.onDestroy();
+        }
+
 
         @Override
         public IBinder onBind(Intent intent) {
