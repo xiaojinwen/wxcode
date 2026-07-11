@@ -49,21 +49,28 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private static final String WECHAT_PACKAGE_PREFIX = "com.tencent.mm";
 
     private LoginHttpServer httpServer;
-    private boolean isLoginInFlight = false;
+    // 用 CAS 保证并发登录请求串行化,避免 check-then-act 竞态
+    private final java.util.concurrent.atomic.AtomicBoolean isLoginInFlight = new java.util.concurrent.atomic.AtomicBoolean(false);
     private Context appContext;
-    private HandlerThread workerThread;
-    private Handler workerHandler;
-    private boolean isForegroundServiceRunning = false;
+    // 多线程共享(HTTP线程/Activity主线程/Service线程),需保证可见性
+    private volatile HandlerThread workerThread;
+    private volatile Handler workerHandler;
+    private volatile boolean isForegroundServiceRunning = false;
     // static 标志：供 KeepAliveService（static 内部类）上报"已真正 startForeground 完成"。
     // 仅当它为 true 时，Android 10 的"有前台Service可后台启动Activity"豁免才成立。
     private static volatile boolean fgServiceActive = false;
     // 省电模式：true=AlarmManager 定时唤醒(省电但响应有延迟)，false=常驻 WakeLock(即时响应)
     private static volatile boolean powerSaverMode = false;
     private Application wechatApplication;
-    private Activity fakeTopActivity;
+    // 主线程(Activity 回调)写入,HTTP 线程读取,需 volatile
+    private volatile Activity fakeTopActivity;
     private ClassLoader savedClassLoader;
+    // 仅用于 forceForegroundState/restoreForegroundState 内部传递 ForegroundDetector 原始状态
     private boolean wasForegroundBeforeLogin = false;
-    private Activity tempWakedActivity = null; // 记录本次登录临时拉起的微信Activity，用于登录后退回后台
+    // doLogin 入口处记录"是否真有前台Activity",供 finally 判断是否要 finish 临时拉起的 Activity。
+    // 与 wasForegroundBeforeLogin 分离,避免被 forceForegroundState 覆盖导致语义冲突。
+    private boolean wasForegroundActivityBeforeLogin = false;
+    private volatile Activity tempWakedActivity = null; // 记录本次登录临时拉起的微信Activity，用于登录后退回后台
 
     // 版本配置JSON
     // a1 = 1参回调(o2)实现类，构造: (LoginTask)；a7 = 2参回调(h80/j)实现类，构造: (LoginTask, o2)
@@ -94,7 +101,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private static final String FOREGROUND_CHANNEL_ID = "wxcode_foreground_keepalive";
 
     // 内存实例表：跨用户实例通过向主端口注册通知汇聚，无需共享文件系统即可多用户共享
-    private static final Object instanceLock = new Object();
     private static final java.util.Map<String, JSONObject> instanceMap = new java.util.concurrent.ConcurrentHashMap<>();
     private Thread heartbeatThread;
 
@@ -172,9 +178,8 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             item.put("port", port);
             item.put("version", version);
             item.put("registerTime", System.currentTimeMillis());
-            synchronized (instanceLock) {
-                instanceMap.put(key, item);
-            }
+            // instanceMap 已是 ConcurrentHashMap,无需额外 synchronized
+            instanceMap.put(key, item);
             XposedBridge.log(TAG + " 内存注册实例: " + key + " :" + port);
         } catch (Exception e) {
             XposedBridge.log(TAG + " 内存注册失败: " + e.getMessage());
@@ -185,25 +190,24 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      * 读取内存实例表并清理5分钟过期的实例
      */
     private JSONArray getMemoryInstances() {
-        synchronized (instanceLock) {
-            long now = System.currentTimeMillis();
-            JSONArray result = new JSONArray();
-            java.util.Iterator<java.util.Map.Entry<String, JSONObject>> it = instanceMap.entrySet().iterator();
-            while (it.hasNext()) {
-                java.util.Map.Entry<String, JSONObject> entry = it.next();
-                try {
-                    JSONObject item = entry.getValue();
-                    if (now - item.getLong("registerTime") < 300000) {
-                        result.put(item);
-                    } else {
-                        it.remove();
-                    }
-                } catch (Exception e) {
+        // ConcurrentHashMap 的迭代器支持并发修改且弱一致,无需额外 synchronized
+        long now = System.currentTimeMillis();
+        JSONArray result = new JSONArray();
+        java.util.Iterator<java.util.Map.Entry<String, JSONObject>> it = instanceMap.entrySet().iterator();
+        while (it.hasNext()) {
+            java.util.Map.Entry<String, JSONObject> entry = it.next();
+            try {
+                JSONObject item = entry.getValue();
+                if (now - item.getLong("registerTime") < 300000) {
+                    result.put(item);
+                } else {
                     it.remove();
                 }
+            } catch (Exception e) {
+                it.remove();
             }
-            return result;
         }
+        return result;
     }
 
     /**
@@ -251,6 +255,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 }
             }
         }, "wxcode-heartbeat");
+        heartbeatThread.setDaemon(true);
         heartbeatThread.start();
         XposedBridge.log(TAG + " 心跳线程启动");
     }
@@ -279,11 +284,11 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             conn.setConnectTimeout(2000);
             conn.setReadTimeout(2000);
             conn.setRequestMethod("GET");
-            BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
             StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) sb.append(line);
-            reader.close();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"))) {
+                String line;
+                while ((line = reader.readLine()) != null) sb.append(line);
+            }
             JSONObject obj = new JSONObject(sb.toString());
             return obj.getJSONArray("instances");
         } catch (Exception e) {
@@ -411,18 +416,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 }
             }
         } catch (Exception ignored) {}
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
-            try {
-                ActivityManager am = (ActivityManager) appContext.getSystemService(Context.ACTIVITY_SERVICE);
-                java.util.List<ActivityManager.RunningTaskInfo> tasks = am.getRunningTasks(1);
-                if (!tasks.isEmpty()) {
-                    ActivityManager.RunningTaskInfo topTask = tasks.get(0);
-                    if (topTask.topActivity != null && topTask.topActivity.getPackageName().equals(currentPackageName)) {
-                        return true;
-                    }
-                }
-            } catch (Exception ignored) {}
-        }
+        // 已删除 getRunningTasks 分支:Android 5.0+ 仅返回调用者自己的任务,targetSdk 33 下属死代码
         return false;
     }
 
@@ -446,7 +440,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         } catch (Exception e) {
             XposedBridge.log(TAG + " 前台Service启动失败[" + e.getClass().getSimpleName() + "]:" + e.getMessage());
             isForegroundServiceRunning = false;
-            startWorkerThread();
         }
     }
 
@@ -517,10 +510,14 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      * 安全停止工作线程
      */
     private void stopWorkerThread() {
-        if (workerThread != null) {
-            workerThread.quitSafely();
-            workerThread = null;
-            workerHandler = null;
+        // 先清空引用再 quitSafely:quitSafely 是异步的,正在执行的 pollTask 可能仍访问
+        // workerHandler/workerThread。先置空让后续 doLogin 检测到 null 会重建,
+        // 而已入队的旧任务通过自身捕获的 handler 引用继续执行,不会读到半空状态。
+        HandlerThread ht = workerThread;
+        workerThread = null;
+        workerHandler = null;
+        if (ht != null) {
+            ht.quitSafely();
         }
     }
 
@@ -593,8 +590,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      * 执行小程序登录，获取code
      */
     public String doLogin(final String str, ClassLoader classLoader) {
-        if (isLoginInFlight) return "{\"err\":-100,\"msg\":\"登录请求正在处理中\"}";
-        isLoginInFlight = true;
+        if (!isLoginInFlight.compareAndSet(false, true)) {
+            return "{\"err\":-100,\"msg\":\"登录请求正在处理中\"}";
+        }
         final String[] res = {null};
         try {
             // 后台登录超时
@@ -610,7 +608,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             // 仅看微信是否真有前台 Activity（fakeTopActivity）。不能依赖 isWeChatForeground()，
             // 因为前台 Service 会抬高进程 importance 让其返回 true，从而错误跳过拉起，导致微信仍后台限速卡住。
             boolean weChatHasForegroundActivity = fakeTopActivity != null && !fakeTopActivity.isFinishing();
-            wasForegroundBeforeLogin = weChatHasForegroundActivity;
+            wasForegroundActivityBeforeLogin = weChatHasForegroundActivity;
             if (!weChatHasForegroundActivity) {
                 // 微信无前台 Activity：其内部按"后台"限速网络，必须真正拉起一个前台 Activity 才能解除限速。
                 // 先拉起前台Service，等其真正 startForeground（异步）后，Android 10 才允许从后台启动 Activity。
@@ -688,17 +686,27 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             };
             synchronized (lockObj) {
                 handler.post(pollTask);
-                lockObj.wait(timeoutMs + 1000);
+                // 用 while 循环检查 res[0]:即使 pollTask 在主线程进入 wait 之前就已完成并 notify,
+                // 主线程进入 synchronized 后会先检查 res[0],非空则立即退出,不会错过通知拖到超时。
+                long deadline = System.currentTimeMillis() + timeoutMs + 1000;
+                while (res[0] == null) {
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0) break;
+                    lockObj.wait(remaining);
+                }
             }
             if (res[0] == null) res[0] = "{\"err\":-210,\"msg\":\"登录超时\"}";
         } catch (Throwable e) {
             XposedBridge.log(TAG + " doLogin异常:" + e.getMessage());
-            res[0] = "{\"err\":-500,\"msg\":\"" + e.getMessage().replace("\"", "\\\"") + "\"}";
+            // getMessage() 可能返回 null(如某些 NPE),直接 replace 会再次抛 NPE
+            String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage().replace("\"", "\\\"");
+            res[0] = "{\"err\":-500,\"msg\":\"" + msg + "\"}";
         } finally {
-            isLoginInFlight = false;
+            isLoginInFlight.set(false);
             restoreForegroundState();
             // 若本次是临时把微信拉到前台，登录结束后退回后台，避免微信一直停留前台打扰用户
-            if (!wasForegroundBeforeLogin && tempWakedActivity != null) {
+            // 用 wasForegroundActivityBeforeLogin(入口处记录)而非 wasForegroundBeforeLogin(被 forceForegroundState 覆盖)
+            if (!wasForegroundActivityBeforeLogin && tempWakedActivity != null) {
                 try {
                     if (tempWakedActivity == fakeTopActivity && !tempWakedActivity.isFinishing()) {
                         tempWakedActivity.finish();
@@ -839,10 +847,8 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.NOT_FOUND, "application/json", "{\"err\":-404,\"msg\":\"接口不存在\"}");
             }
 
-            // 请求级自愈：确保前台 Service 就绪，避免后台进程被 Doze 限流导致 HTTP 无响应。
-            // 已就绪时近零开销（一次 volatile 读 + 一次 isHeld 判断）；未就绪时最多阻塞 1.5s。
-            outer.ensureForegroundForBackground();
-            outer.waitForForegroundService(1500);
+            // 仅对 /login 等关键接口做请求级自愈(在对应分支内调用),普通查询接口(首页/whoami/instances/config)
+            // 不阻塞等待,避免每个请求都被拖最多 1.5s 影响首页加载。
 
             String uri = iHTTPSession.getUri();
 
@@ -934,6 +940,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
 
             // /login 接口：执行登录
             if (uri.equals("/login")) {
+                // 登录依赖网络请求,后台时必须确保前台 Service 就绪以免被 Doze 限流
+                outer.ensureForegroundForBackground();
+                outer.waitForForegroundService(1500);
                 return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", outer.doLogin(iHTTPSession.getParms().getOrDefault("appId", DEFAULT_AUTO_APP_ID), classLoader));
             }
 
@@ -1146,6 +1155,15 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 sb.append("<div style='display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px'>");
                 sb.append("<button onclick='switchMode(\"performance\")' style='padding:10px 20px;font-size:14px;cursor:pointer;background:#4CAF50;color:#fff;border:none;border-radius:6px'>⚡ 性能模式（即时响应，耗电3-9%/天）</button>");
                 sb.append("<button onclick='switchMode(\"power_saver\")' style='padding:10px 20px;font-size:14px;cursor:pointer;background:#2196F3;color:#fff;border:none;border-radius:6px'>🔋 省电模式（定时唤醒，耗电0.1%/天，响应延迟2-9分钟）</button>");
+                sb.append("</div>");
+                sb.append("<div style='background:#fff8e1;border-left:4px solid #ff9800;padding:12px 15px;border-radius:8px;margin:12px 0;font-size:0.92em;color:#5d4037'>");
+                sb.append("<strong>⚠️ 重要提示：</strong><br>");
+                sb.append("<strong>性能模式</strong>需在系统设置中将微信设为<strong>“后台无限制/允许后台活动”</strong>才能即时响应，否则系统仍会限制网络，导致请求卡顿。<br>");
+                sb.append("<span style='color:#666;font-size:0.9em'>设置路径参考：</span><br>");
+                sb.append("<span style='color:#666;font-size:0.9em'>• MIUI/澎湃OS：设置 → 应用设置 → 微信 → 省电策略 → 无限制（并开启自启动）</span><br>");
+                sb.append("<span style='color:#666;font-size:0.9em'>• HarmonyOS/EMUI：设置 → 应用 → 微信 → 耗电详情 → 启动管理 → 关闭自动管理，全部手动允许</span><br>");
+                sb.append("<span style='color:#666;font-size:0.9em'>• ColorOS/OriginOS：设置 → 电池 → 微信 → 后台保持运行/允许后台活动（并开启自启动）</span><br>");
+                sb.append("<span style='display:block;margin-top:6px'><strong>省电模式</strong>通过 AlarmManager 定时唤醒，对后台限制更鲁棒，但响应有 2-9 分钟延迟。</span>");
                 sb.append("</div>");
                 sb.append("<script>");
                 sb.append("fetch('/config').then(r=>r.json()).then(d=>{document.getElementById('currentMode').textContent=d.modeDesc;});");
