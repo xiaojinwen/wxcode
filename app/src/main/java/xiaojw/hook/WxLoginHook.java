@@ -9,7 +9,6 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.os.Build;
-import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
@@ -23,11 +22,6 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 import fi.iki.elonen.NanoHTTPD;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.RandomAccessFile;
-import java.nio.channels.FileLock;
 import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -35,6 +29,11 @@ import java.lang.reflect.Method;
 import java.time.LocalDateTime;
 import java.util.Iterator;
 import java.util.LinkedList;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -43,11 +42,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private static final String DEFAULT_AUTO_APP_ID = "wxaa3a999db5d744c6";
     private static final String TAG = "xiaojw-wxcode";
     private static final String WECHAT_PACKAGE_PREFIX = "com.tencent.mm";
-
-    // 全局共享注册表路径 ROOT跨多用户专用
-    private static final String GLOBAL_REGISTRY_DIR = "/data/misc/wxcode/";
-    private static final String GLOBAL_REGISTRY_NAME = "registry.json";
-    private String registryFilePath = null;
 
     // 执行模式常量
     private static final String MODE_FOREGROUND_SERVICE = "foreground_service";
@@ -85,73 +79,19 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private String currentPackageName = "";
     private int currentUserId = 0;
     private int httpPort = 8088;
+    // 主端口：所有分身实例向该端口(用户0的8088)发送注册通知，由其汇总所有启动的端口
+    private static final int MASTER_PORT = 8088;
+
+    // 内存实例表：跨用户实例通过向主端口注册通知汇聚，无需共享文件系统即可多用户共享
+    private final Object instanceLock = new Object();
+    private final java.util.Map<String, JSONObject> instanceMap = new java.util.concurrent.ConcurrentHashMap<>();
+    private Thread heartbeatThread;
 
     /**
-     * 判断是否微信/微信分身包名
+     * 判断是否微信包名（系统分身与主应用包名相同）
      */
     private boolean isWeChatPackage(String packageName) {
-        if (packageName == null) return false;
-        if (packageName.equals("com.tencent.mm")) return true;
-        if (packageName.startsWith("com.tencent.mm:")) return true;
-        if (packageName.startsWith("com.tencent.mm_")) return true;
-        if (packageName.startsWith("com.tencent.mm.")) return true;
-        if (packageName.contains("tencent.mm") && packageName.length() > "com.tencent.mm".length()) return true;
-        return false;
-    }
-
-    /**
-     * 初始化全局共享注册表路径，ROOT自动赋777权限
-     */
-    private void initRegistryFilePath() {
-        File globalDir = new File(GLOBAL_REGISTRY_DIR);
-        registryFilePath = GLOBAL_REGISTRY_DIR + GLOBAL_REGISTRY_NAME;
-        File regFile = new File(registryFilePath);
-
-        try {
-            if (!globalDir.exists()) {
-                globalDir.mkdirs();
-                XposedBridge.log(TAG + " 创建全局共享目录: " + globalDir.getAbsolutePath());
-            }
-            // ROOT授权全用户读写
-            Runtime.getRuntime().exec("chmod 777 " + GLOBAL_REGISTRY_DIR);
-            Runtime.getRuntime().exec("chmod 777 " + registryFilePath);
-            // 文件权限全局可读可写
-            globalDir.setReadable(true, false);
-            globalDir.setWritable(true, false);
-            globalDir.setExecutable(true, false);
-            regFile.setReadable(true, false);
-            regFile.setWritable(true, false);
-            XposedBridge.log(TAG + " [" + currentPackageName + " User:" + currentUserId + "] 全局共享注册表路径: " + registryFilePath);
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " 全局目录授权失败，设备未ROOT，降级本地存储: " + e.getMessage());
-            fallbackLocalRegistryPath();
-        }
-    }
-
-    /**
-     * 无ROOT降级方案：仅当前用户分身互通
-     */
-    private void fallbackLocalRegistryPath() {
-        try {
-            File externalDir = Environment.getExternalStorageDirectory();
-            if (externalDir != null && externalDir.canWrite()) {
-                registryFilePath = externalDir.getAbsolutePath() + "/wxcode_registry.json";
-                XposedBridge.log(TAG + " 降级外部存储注册表: " + registryFilePath);
-                return;
-            }
-        } catch (Exception ignored) {}
-        try {
-            if (appContext != null) {
-                File appExternalDir = appContext.getExternalFilesDir(null);
-                if (appExternalDir != null) {
-                    registryFilePath = appExternalDir.getAbsolutePath() + "/wxcode_registry.json";
-                    XposedBridge.log(TAG + " 降级应用私有外部存储: " + registryFilePath);
-                    return;
-                }
-            }
-        } catch (Exception ignored) {}
-        registryFilePath = "/data/local/tmp/wxcode_registry.json";
-        XposedBridge.log(TAG + " 降级 /data/local/tmp 注册表: " + registryFilePath);
+        return WECHAT_PACKAGE_PREFIX.equals(packageName);
     }
 
     /**
@@ -197,147 +137,132 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 根据包名+UserID计算唯一端口，避免冲突
+     * 根据 User ID 计算唯一端口，系统分身包名均为 com.tencent.mm
      */
-    private int calculatePort(String packageName, int userId) {
-        int basePort = 8088;
-        if (userId > 0) {
-            if (userId < 100) {
-                basePort = basePort + userId;
-            } else {
-                basePort = 8200 + (userId % 100);
-            }
-            XposedBridge.log(TAG + " [" + packageName + "] UID端口偏移: " + basePort);
+    private int calculatePort(int userId) {
+        if (userId <= 0) {
+            XposedBridge.log(TAG + " [" + currentPackageName + "] 端口:8088 UID:" + userId);
+            return 8088;
         }
-        if (!packageName.equals("com.tencent.mm")) {
-            if (packageName.endsWith(":dual")) return basePort + 1;
-            if (packageName.endsWith(":clone")) return basePort + 2;
-            if (packageName.endsWith("_1")) return basePort + 3;
-            if (packageName.endsWith("_2")) return basePort + 4;
-            if (packageName.endsWith("_xiaomi")) return basePort + 5;
-            if (packageName.endsWith(".dual")) return basePort + 6;
-            if (packageName.endsWith(".clone")) return basePort + 7;
-            int sum = 0;
-            for (int i = "com.tencent.mm".length(); i < packageName.length(); i++) {
-                sum += packageName.charAt(i);
-            }
-            int extraOffset = 8 + (sum % 100);
-            int port = basePort + extraOffset;
-            if (port > 9000) {
-                port = 8096 + ((port - 8096) % 900);
-            }
-            XposedBridge.log(TAG + " [" + packageName + "] 后缀偏移:" + extraOffset + " 最终端口:" + port);
-            return port;
-        }
-        XposedBridge.log(TAG + " [" + packageName + "] 端口:" + basePort + " UID:" + userId);
-        return basePort;
+        int port = userId < 100 ? 8088 + userId : 8200 + (userId % 100);
+        XposedBridge.log(TAG + " [" + currentPackageName + "] 端口:" + port + " UID:" + userId);
+        return port;
     }
 
     /**
-     * 注册当前分身实例到全局共享注册表
+     * 将实例注册到内存实例表（跨用户共享的主要数据源，无需共享文件系统）
      */
-    private void registerInstance(String packageName, int userId, int port, String version) {
+    private void registerInstanceInMemory(String packageName, int userId, int port, String version) {
         try {
-            JSONArray registry = readRegistry();
-            registry = cleanExpiredInstances(registry);
-            // 移除同包同UID旧记录
-            for (int i = 0; i < registry.length(); i++) {
-                JSONObject item = registry.getJSONObject(i);
-                if (item.getString("packageName").equals(packageName) && item.getInt("userId") == userId) {
-                    registry.remove(i);
+            String key = packageName + "_" + userId;
+            JSONObject item = new JSONObject();
+            item.put("packageName", packageName);
+            item.put("userId", userId);
+            item.put("port", port);
+            item.put("version", version);
+            item.put("registerTime", System.currentTimeMillis());
+            synchronized (instanceLock) {
+                instanceMap.put(key, item);
+            }
+            XposedBridge.log(TAG + " 内存注册实例: " + key + " :" + port);
+        } catch (Exception e) {
+            XposedBridge.log(TAG + " 内存注册失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 读取内存实例表并清理5分钟过期的实例
+     */
+    private JSONArray getMemoryInstances() {
+        synchronized (instanceLock) {
+            long now = System.currentTimeMillis();
+            JSONArray result = new JSONArray();
+            java.util.Iterator<java.util.Map.Entry<String, JSONObject>> it = instanceMap.entrySet().iterator();
+            while (it.hasNext()) {
+                java.util.Map.Entry<String, JSONObject> entry = it.next();
+                try {
+                    JSONObject item = entry.getValue();
+                    if (now - item.getLong("registerTime") < 300000) {
+                        result.put(item);
+                    } else {
+                        it.remove();
+                    }
+                } catch (Exception e) {
+                    it.remove();
+                }
+            }
+            return result;
+        }
+    }
+
+    /**
+     * 非主端口实例：向主端口(8088)发送注册通知
+     */
+    private void notifyMasterRegister(int port, int userId, String version) {
+        new Thread(() -> {
+            HttpURLConnection conn = null;
+            try {
+                String url = "http://127.0.0.1:" + MASTER_PORT + "/register?port=" + port
+                        + "&userId=" + userId
+                        + "&version=" + URLEncoder.encode(version, "UTF-8")
+                        + "&packageName=" + URLEncoder.encode(currentPackageName, "UTF-8");
+                conn = (HttpURLConnection) new URL(url).openConnection();
+                conn.setConnectTimeout(2000);
+                conn.setReadTimeout(2000);
+                conn.setRequestMethod("GET");
+                int code = conn.getResponseCode();
+                XposedBridge.log(TAG + " 向主端口注册完成 HTTP:" + code);
+            } catch (Exception e) {
+                XposedBridge.log(TAG + " 向主端口注册失败(127.0.0.1:" + MASTER_PORT + " 不可达?): " + e.getMessage());
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        }).start();
+    }
+
+    /**
+     * 非主端口实例：定时向主端口重新注册，维持存活（主端口按5分钟过期清理）
+     */
+    private void startHeartbeat() {
+        if (heartbeatThread != null && heartbeatThread.isAlive()) return;
+        heartbeatThread = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Thread.sleep(60000);
+                    notifyMasterRegister(httpPort, currentUserId, versionName);
+                } catch (InterruptedException e) {
                     break;
                 }
             }
-            JSONObject instance = new JSONObject();
-            instance.put("packageName", packageName);
-            instance.put("userId", userId);
-            instance.put("port", port);
-            instance.put("version", version);
-            instance.put("registerTime", System.currentTimeMillis());
-            registry.put(instance);
-            writeRegistry(registry);
-            XposedBridge.log(TAG + " 全局注册表注册实例: " + packageName + " UID" + userId + " :" + port);
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " 注册实例失败: " + e.getMessage());
-        }
+        }, "wxcode-heartbeat");
+        heartbeatThread.start();
+        XposedBridge.log(TAG + " 心跳线程启动，定时向主端口注册");
     }
 
     /**
-     * 带共享读锁读取注册表，防止并发损坏JSON
+     * 非主端口实例：从主端口拉取汇总后的实例列表
      */
-    private JSONArray readRegistry() {
-        if (registryFilePath == null) initRegistryFilePath();
-        File file = new File(registryFilePath);
-        if (!file.exists()) return new JSONArray();
-        RandomAccessFile raf = null;
-        FileLock lock = null;
-        JSONArray result = new JSONArray();
+    private JSONArray fetchMasterInstances() {
+        HttpURLConnection conn = null;
         try {
-            raf = new RandomAccessFile(file, "r");
-            lock = raf.getChannel().lock(0, Long.MAX_VALUE, true);
-            byte[] data = new byte[(int) raf.length()];
-            raf.readFully(data);
-            result = new JSONArray(new String(data, "UTF-8"));
+            URL url = new URL("http://127.0.0.1:" + MASTER_PORT + "/instances");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(2000);
+            conn.setReadTimeout(2000);
+            conn.setRequestMethod("GET");
+            BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) sb.append(line);
+            reader.close();
+            JSONObject obj = new JSONObject(sb.toString());
+            return obj.getJSONArray("instances");
         } catch (Exception e) {
-            XposedBridge.log(TAG + " 读取注册表异常: " + e.getMessage());
+            XposedBridge.log(TAG + " 从主端口拉取实例失败: " + e.getMessage());
+            return null;
         } finally {
-            try {
-                if (lock != null) lock.release();
-                if (raf != null) raf.close();
-            } catch (Exception ignored) {}
+            if (conn != null) conn.disconnect();
         }
-        return result;
-    }
-
-    /**
-     * 独占写锁写入注册表，多进程串行写入
-     */
-    private void writeRegistry(JSONArray registry) {
-        if (registryFilePath == null) initRegistryFilePath();
-        File file = new File(registryFilePath);
-        File parentDir = file.getParentFile();
-        if (parentDir != null && !parentDir.exists()) parentDir.mkdirs();
-        RandomAccessFile raf = null;
-        FileLock lock = null;
-        try {
-            raf = new RandomAccessFile(file, "rw");
-            lock = raf.getChannel().lock();
-            raf.setLength(0);
-            byte[] content = registry.toString().getBytes("UTF-8");
-            raf.write(content);
-            // 重新授权全局权限
-            Runtime.getRuntime().exec("chmod 777 " + registryFilePath);
-            file.setReadable(true, false);
-            file.setWritable(true, false);
-            XposedBridge.log(TAG + " 全局注册表写入成功");
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " 写入注册表失败: " + e.getMessage() + " path:" + registryFilePath);
-        } finally {
-            try {
-                if (lock != null) lock.release();
-                if (raf != null) raf.close();
-            } catch (Exception ignored) {}
-        }
-    }
-
-    /**
-     * 清理5分钟过期实例记录
-     */
-    private JSONArray cleanExpiredInstances(JSONArray registry) {
-        long now = System.currentTimeMillis();
-        JSONArray cleaned = new JSONArray();
-        try {
-            for (int i = 0; i < registry.length(); i++) {
-                JSONObject item = registry.getJSONObject(i);
-                long registerTime = item.getLong("registerTime");
-                if (now - registerTime < 300000) {
-                    cleaned.put(item);
-                }
-            }
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " 清理过期实例失败: " + e.getMessage());
-        }
-        return cleaned;
     }
 
     /**
@@ -603,10 +528,8 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 Context context = (Context) param.args[0];
                 ClassLoader classLoader = context.getClassLoader();
                 appContext = context;
-                // 初始化全局共享注册表路径
-                initRegistryFilePath();
                 currentUserId = getUserId();
-                httpPort = calculatePort(currentPackageName, currentUserId);
+                httpPort = calculatePort(currentUserId);
                 PackageInfo pkgInfo = context.getPackageManager().getPackageInfo(currentPackageName, 0);
                 versionName = pkgInfo.versionName;
                 XposedBridge.log(TAG + " [" + currentPackageName + "] UID:" + currentUserId + " Ver:" + versionName + " Port:" + httpPort);
@@ -622,8 +545,15 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     httpServer = new LoginHttpServer(WxLoginHook.this, httpPort, classLoader);
                     httpServer.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false);
                     XposedBridge.log(TAG + " HTTP服务启动成功 http://0.0.0.0:" + httpPort);
-                    // 写入全局共享注册表
-                    registerInstance(currentPackageName, currentUserId, httpPort, versionName);
+                    // 本地注册自己到内存实例表
+                    registerInstanceInMemory(currentPackageName, currentUserId, httpPort, versionName);
+                    // 非主端口实例：向主端口(8088)发送注册通知并启动心跳，由主端口汇总所有端口
+                    if (httpPort != MASTER_PORT) {
+                        notifyMasterRegister(httpPort, currentUserId, versionName);
+                        startHeartbeat();
+                    } else {
+                        XposedBridge.log(TAG + " 当前即主端口(8088)，负责汇总所有实例");
+                    }
                     initConfig(context);
                 } catch (IOException e) {
                     XposedBridge.log(TAG + " HTTP服务启动失败:" + e.getMessage());
@@ -814,27 +744,52 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 }
             }
 
-            // /instances 接口：返回所有已启动的实例（实时数据）
+            // /register 接口：接收其他分身实例的注册通知，汇聚到内存实例表
+            if (uri.equals("/register")) {
+                try {
+                    String portStr = iHTTPSession.getParms().get("port");
+                    String userIdStr = iHTTPSession.getParms().get("userId");
+                    String ver = iHTTPSession.getParms().getOrDefault("version", "");
+                    String pkg = iHTTPSession.getParms().getOrDefault("packageName", "com.tencent.mm");
+                    if (portStr != null && userIdStr != null) {
+                        outer.registerInstanceInMemory(pkg, Integer.parseInt(userIdStr), Integer.parseInt(portStr), ver);
+                        JSONObject r = new JSONObject();
+                        r.put("success", true);
+                        r.put("registeredPort", portStr);
+                        return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", r.toString());
+                    }
+                    return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.BAD_REQUEST, "application/json", "{\"err\":-1,\"msg\":\"missing port/userId\"}");
+                } catch (Exception e) {
+                    return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "application/json", "{\"err\":-500,\"msg\":\"" + e.getMessage() + "\"}");
+                }
+            }
+
+            // /instances 接口：返回所有已启动的实例（主端口汇总内存表 / 其他实例向主端口拉取）
             if (uri.equals("/instances")) {
                 try {
-                    JSONArray registry = outer.readRegistry();
-                    registry = outer.cleanExpiredInstances(registry);
+                    JSONArray instances;
+                    if (outer.httpPort == MASTER_PORT) {
+                        instances = outer.getMemoryInstances();
+                    } else {
+                        JSONArray master = outer.fetchMasterInstances();
+                        instances = master != null ? master : outer.getMemoryInstances();
+                    }
 
                     JSONObject portMap = new JSONObject();
-                    for (int i = 0; i < registry.length(); i++) {
-                        JSONObject item = registry.getJSONObject(i);
+                    for (int i = 0; i < instances.length(); i++) {
+                        JSONObject item = instances.getJSONObject(i);
                         String key = item.getString("packageName") + "_User" + item.getInt("userId");
                         portMap.put(key, item.getInt("port"));
                     }
 
                     JSONObject result = new JSONObject();
-                    result.put("instances", registry);
+                    result.put("instances", instances);
                     result.put("portMap", portMap);
                     result.put("current", outer.currentPackageName);
                     result.put("currentUserId", outer.currentUserId);
                     result.put("currentPort", outer.httpPort);
-                    result.put("count", registry.length());
-                    result.put("registryFile", outer.registryFilePath);
+                    result.put("count", instances.length());
+                    result.put("role", outer.httpPort == MASTER_PORT ? "master" : "slave");
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", result.toString());
                 } catch (Exception e) {
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "application/json", "{\"err\":-500,\"msg\":\"" + e.getMessage() + "\"}");
@@ -1042,6 +997,33 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 sb.append("<div class='container'>");
                 sb.append("<h1>📦 wxcode </h1>");
 
+                // 动态实例列表区域（通过 JavaScript 加载）
+                sb.append("<h2>📋 所有已启动实例</h2>");
+                sb.append("<div id='instance-list' class='instance-list'>");
+                sb.append("<p style='color:#666;'>正在加载实例列表...</p>");
+                sb.append("</div>");
+                sb.append("<script>");
+                sb.append("fetch('/instances').then(r => r.json()).then(data => {");
+                sb.append("  const list = document.getElementById('instance-list');");
+                sb.append("  if (data.count === 0) {");
+                sb.append("    list.innerHTML = '<p style=\"color:#e74c3c;\">⚠️ 实例列表为空，可能原因：</p><ul><li>微信刚启动，实例尚未注册</li><li>主端口(8088)未启动，分身实例无法上报</li></ul><p>请刷新页面重试，或检查日志。</p>';");
+                sb.append("    return;");
+                sb.append("  }");
+                sb.append("  let html = '<p>共检测到 <strong>' + data.count + '</strong> 个已启动的微信实例：</p>';");
+                sb.append("  data.instances.forEach(inst => {");
+                sb.append("    const isCurrent = inst.packageName === data.current && inst.userId === data.currentUserId;");
+                sb.append("    html += '<div class=\"instance-item' + (isCurrent ? ' current' : '') + '\">';");
+                sb.append("    html += '<span><code>' + inst.packageName + '</code> (User ' + inst.userId + ') | 版本 ' + inst.version + '</span>';");
+                sb.append("    html += '<span class=\"port\">端口 ' + inst.port + '</span>';");
+                sb.append("    html += '</div>';");
+                sb.append("  });");
+
+                sb.append("  list.innerHTML = html;");
+                sb.append("}).catch(e => {");
+                sb.append("  document.getElementById('instance-list').innerHTML = '<p style=\"color:#e74c3c;\">❌ 加载失败: ' + e + '</p><p>请检查 HTTP 服务是否正常运行。</p>';");
+                sb.append("});");
+                sb.append("</script>");
+
                 sb.append("<h2>📦 当前实例信息</h2>");
                 sb.append("<p><strong>包名：</strong> <code>").append(outer.currentPackageName).append("</code></p>");
                 sb.append("<p><strong>User ID：</strong> <code>").append(String.valueOf(outer.currentUserId)).append("</code> <small style='color:#666;'>（用于区分系统级分身）</small></p>");
@@ -1073,21 +1055,16 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 sb.append("<tr><td><code>/login</code></td><td>执行登录获取code</td><td><a href='/login?appId=wxaa3a999db5d744c6'>点击测试</a></td></tr>");
                 sb.append("</tbody></table>");
                 sb.append("<h2>💡 分身端口映射</h2>");
-                sb.append("<p>端口计算公式：<code>基础端口(8088) + User ID偏移 + 包名后缀偏移</code></p>");
-                sb.append("<p><code>大于100的userId: (8200+999%100)</code></p>");
+                sb.append("<p>端口计算公式：<code>基础端口(8088) + User ID偏移</code></p>");
+                sb.append("<p><code>User ID &gt; 100 时: 8200 + (User ID % 100)</code></p>");
                 sb.append("<table>");
                 sb.append("<thead><tr><th>类型</th><th>标识</th><th>端口</th></tr></thead>");
                 sb.append("<tbody>");
                 sb.append("<tr><td>主用户微信</td><td><code>com.tencent.mm (User 0)</code></td><td>8088</td></tr>");
-                sb.append("<tr><td>系统分身</td><td><code>com.tencent.mm (User 999)</code></td><td>8299</td></tr>");
-                sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm:dual</code></td><td>8089</td></tr>");
-                sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm:clone</code></td><td>8090</td></tr>");
-                sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm_1</code></td><td>8091</td></tr>");
-                sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm_2</code></td><td>8092</td></tr>");
-                sb.append("<tr><td>包名后缀分身</td><td><code>com.tencent.mm_xiaomi</code></td><td>8093</td></tr>");
-                sb.append("<tr><td>其他分身</td><td><code>动态计算</code></td><td>8096-9000</td></tr>");
+                sb.append("<tr><td>系统分身(OPPO/vivo等)</td><td><code>com.tencent.mm (User 10)</code></td><td>8098</td></tr>");
+                sb.append("<tr><td>系统分身(小米等)</td><td><code>com.tencent.mm (User 999)</code></td><td>8299</td></tr>");
                 sb.append("</tbody></table>");
-                sb.append("<p>💡 提示：访问 <a href='/whoami'>/whoami</a> 可确认当前实例信息，访问 <a href='/instances'>/instances</a> 可查看所有实例</p>");
+                sb.append("<p>💡 提示：系统分身包名均为 <code>com.tencent.mm</code>。所有分身启动后向主端口(用户0的<code>8088</code>)发送注册通知，由主端口汇总所有端口；访问任意实例的 <a href='/instances'>/instances</a> 即可看到全部（主端口<code>role=master</code>，其余<code>slave</code>）。跨用户共享依赖<code>127.0.0.1</code>互通（多数系统分身满足）。</p>");
                 sb.append("<h2>📋 适配版本列表</h2>");
                 sb.append("<table>");
                 sb.append("<thead>");

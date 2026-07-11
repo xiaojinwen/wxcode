@@ -22,7 +22,7 @@
         <!-- LSPosed支持多作用域，使用逗号分隔或留空让用户手动选择 -->
         <meta-data
             android:name="xposedscope"
-            android:value="com.tencent.mm,com.tencent.mm:dual,com.tencent.mm.clone"/>
-        <!-- 提示：如有其他分身包名，请在LSPosed中手动勾选作用域 -->
+            android:value="com.tencent.mm"/>
+        <!-- 系统分身与主应用包名相同，勾选 com.tencent.mm 即可覆盖所有实例 -->
     </application>
 </manifest>
