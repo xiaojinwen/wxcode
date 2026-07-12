@@ -67,10 +67,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private ClassLoader savedClassLoader;
     // 仅用于 forceForegroundState/restoreForegroundState 内部传递 ForegroundDetector 原始状态
     private boolean wasForegroundBeforeLogin = false;
-    // doLogin 入口处记录"是否真有前台Activity",供 finally 判断是否要 finish 临时拉起的 Activity。
-    // 与 wasForegroundBeforeLogin 分离,避免被 forceForegroundState 覆盖导致语义冲突。
-    private boolean wasForegroundActivityBeforeLogin = false;
-    private volatile Activity tempWakedActivity = null; // 记录本次登录临时拉起的微信Activity，用于登录后退回后台
 
     // 版本配置JSON
     // a1 = 1参回调(o2)实现类，构造: (LoginTask)；a7 = 2参回调(h80/j)实现类，构造: (LoginTask, o2)
@@ -521,22 +517,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * 拉起微信到前台
-     */
-    private void tempWakeupWeChat() {
-        try {
-            Intent intent = appContext.getPackageManager().getLaunchIntentForPackage(currentPackageName);
-            if (intent != null) {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                appContext.startActivity(intent);
-                Thread.sleep(500);
-            }
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " 唤醒微信失败:" + e.getMessage());
-        }
-    }
-
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam loadPackageParam) throws Throwable {
         if (!isWeChatPackage(loadPackageParam.packageName)) return;
@@ -605,24 +585,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             Class<?> j1Cls = XposedHelpers.findClass(this.j1, classLoader);
             XposedBridge.log(TAG + " a1=" + this.a1 + " a7=" + this.a7);
             XposedBridge.log(TAG + " 发起登录 appId=" + str);
-            // 仅看微信是否真有前台 Activity（fakeTopActivity）。不能依赖 isWeChatForeground()，
-            // 因为前台 Service 会抬高进程 importance 让其返回 true，从而错误跳过拉起，导致微信仍后台限速卡住。
-            boolean weChatHasForegroundActivity = fakeTopActivity != null && !fakeTopActivity.isFinishing();
-            wasForegroundActivityBeforeLogin = weChatHasForegroundActivity;
-            if (!weChatHasForegroundActivity) {
-                // 微信无前台 Activity：其内部按"后台"限速网络，必须真正拉起一个前台 Activity 才能解除限速。
-                // 先拉起前台Service，等其真正 startForeground（异步）后，Android 10 才允许从后台启动 Activity。
-                ensureForegroundForBackground();
-                waitForForegroundService(1000);
-                tempWakeupWeChat();
-                // 等微信主界面 resume，记录我们临时拉起的 Activity，供登录结束后退回后台
-                try { Thread.sleep(400); } catch (InterruptedException ignored) {}
-                if (fakeTopActivity != null && !fakeTopActivity.isFinishing()) {
-                    tempWakedActivity = fakeTopActivity;
-                }
-                XposedBridge.log(TAG + " 后台拉起微信后: fgServiceActive=" + fgServiceActive
-                        + " fakeTopActivity=" + (fakeTopActivity == null ? "null" : fakeTopActivity.getClass().getSimpleName()));
-            }
+            // 后台时确保前台 Service 就绪，避免网络请求被 Doze 限流
+            ensureForegroundForBackground();
+            waitForForegroundService(1000);
             forceForegroundState(classLoader);
             Object loginTask = XposedHelpers.newInstance(LoginTaskCls);
             setField(loginTask, "o", "login");
@@ -704,16 +669,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         } finally {
             isLoginInFlight.set(false);
             restoreForegroundState();
-            // 若本次是临时把微信拉到前台，登录结束后退回后台，避免微信一直停留前台打扰用户
-            // 用 wasForegroundActivityBeforeLogin(入口处记录)而非 wasForegroundBeforeLogin(被 forceForegroundState 覆盖)
-            if (!wasForegroundActivityBeforeLogin && tempWakedActivity != null) {
-                try {
-                    if (tempWakedActivity == fakeTopActivity && !tempWakedActivity.isFinishing()) {
-                        tempWakedActivity.finish();
-                    }
-                } catch (Throwable ignored) {}
-                tempWakedActivity = null;
-            }
             // 前台 Service 现为 HTTP server 常驻依赖，不在登录结束时停止
         }
         return res[0];
@@ -938,11 +893,8 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 }
             }
 
-            // /login 接口：执行登录
+            // /login 接口：执行登录（后台唤醒逻辑已由 doLogin 内部按需处理）
             if (uri.equals("/login")) {
-                // 登录依赖网络请求,后台时必须确保前台 Service 就绪以免被 Doze 限流
-                outer.ensureForegroundForBackground();
-                outer.waitForForegroundService(1500);
                 return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", outer.doLogin(iHTTPSession.getParms().getOrDefault("appId", DEFAULT_AUTO_APP_ID), classLoader));
             }
 
