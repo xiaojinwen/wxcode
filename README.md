@@ -1,39 +1,107 @@
 # wxcode
 
-#### 介绍
-{**以下是 Gitee 平台说明，您可以替换此简介**
-Gitee 是 OSCHINA 推出的基于 Git 的代码托管平台（同时支持 SVN）。专为开发者提供稳定、高效、安全的云端软件开发协作平台
-无论是个人、团队、或是企业，都能够用 Gitee 实现代码托管、项目管理、协作开发。企业项目请看 [https://gitee.com/enterprises](https://gitee.com/enterprises)}
+微信小程序登录 Hook 模块（Xposed）
 
-#### 软件架构
-软件架构说明
+## 功能特性
 
+- **小程序登录** - 通过 HTTP 接口获取微信小程序登录 code
+- **多账号支持** - 支持微信多开、系统分身，自动分配端口
+- **后台保活** - 前台 Service 提升进程优先级，避免后台网络限流
+- **双模式切换** - 性能模式（即时响应）/ 省电模式（低功耗）
+- **版本适配** - 支持微信 8.0.49 ~ 8.0.76 多个版本
 
-#### 安装教程
+## 环境要求
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+- Android 4.2+ (API 17+)
+- 已安装 Xposed/LSPosed/EdXposed 框架
+- 微信版本：8.0.49 / 8.0.62 / 8.0.70 / 8.0.71 / 8.0.72 / 8.0.74 / 8.0.76
 
-#### 使用说明
+## 安装教程
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+1. 编译项目生成 APK，或在 Releases 下载已编译版本
+2. 安装 APK 到手机
+3. 在 Xposed/LSPosed 管理器中勾选本模块，作用域选择微信
+4. 重启微信（或重启手机）
 
-#### 参与贡献
+## 使用说明
 
-1.  Fork 本仓库
-2.  新建 Feat_xxx 分支
-3.  提交代码
-4.  新建 Pull Request
+### 基本使用
 
+模块加载后会在微信启动时自动开启 HTTP 服务：
 
-#### 特技
+- **主用户微信**：`http://127.0.0.1:8088`
+- **系统分身微信**：端口 = 8088 + User ID（如 User 10 → 8098）
 
-1.  使用 Readme\_XXX.md 来支持不同的语言，例如 Readme\_en.md, Readme\_zh.md
-2.  Gitee 官方博客 [blog.gitee.com](https://blog.gitee.com)
-3.  你可以 [https://gitee.com/explore](https://gitee.com/explore) 这个地址来了解 Gitee 上的优秀开源项目
-4.  [GVP](https://gitee.com/gvp) 全称是 Gitee 最有价值开源项目，是综合评定出的优秀开源项目
-5.  Gitee 官方提供的使用手册 [https://gitee.com/help](https://gitee.com/help)
-6.  Gitee 封面人物是一档用来展示 Gitee 会员风采的栏目 [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+在浏览器访问 `http://127.0.0.1:8088` 可查看实例信息和版本适配情况。
+
+### API 接口
+
+| 接口 | 说明 | 示例 |
+|------|------|------|
+| `/login` | 执行登录获取 code | `/login?appId=wxaa3a999db5d744c6` |
+| `/whoami` | 返回当前实例信息 | `/whoami` |
+| `/instances` | 返回所有已启动实例 | `/instances` |
+| `/config` | 查看/切换保活模式 | `/config?mode=power_saver` |
+
+### 保活模式
+
+| 模式 | 特点 | 适用场景 |
+|------|------|----------|
+| **性能模式** | WakeLock 常驻，即时响应 | 需要实时响应，可接受耗电 |
+| **省电模式** | AlarmManager 定时唤醒 | 后台长期运行，可接受 2-9 分钟延迟 |
+
+> **性能模式**需在系统设置中将微信设为"后台无限制/允许后台活动"，否则系统仍会限制网络。
+
+### 端口计算
+
+```
+基础端口: 8088
+User ID ≤ 100: 端口 = 8088 + User ID
+User ID > 100: 端口 = 8200 + (User ID % 100)
+```
+
+## 技术架构
+
+```
+├── app/src/main/
+│   ├── assets/xposed_init          # Xposed 入口类声明
+│   └── java/xiaojw/hook/
+│       └── WxLoginHook.java        # 核心 Hook 逻辑
+│           ├── HTTP Server         # NanoHTTPD 嵌入式服务
+│           ├── KeepAliveService    # 前台保活 Service
+│           └── Login Hook          # 微信登录 Hook
+└── libs/api-82.jar                 # Xposed API
+```
+
+### 核心原理
+
+1. Hook 微信 `JsApiLogin$LoginTask` 相关类
+2. 通过反射设置登录参数并触发登录
+3. 轮询获取登录结果 code
+4. 通过 HTTP 接口对外提供服务
+
+## 常见问题
+
+**Q: 提示"登录超时"？**
+A: 检查微信是否在前台运行，或切换到性能模式并授予微信后台无限制权限。
+
+**Q: 分身微信无法使用？**
+A: 确保所有分身实例都已勾选模块作用域，访问 `/instances` 接口确认实例已注册。
+
+**Q: 如何查看当前端口？**
+A: 访问 `http://127.0.0.1:8088/whoami` 查看当前实例信息。
+
+## 免责声明
+
+本项目仅供学习研究，请勿用于非法用途。使用本模块产生的一切后果由使用者自行承担。
+
+## 开源协议
+
+MIT License
+
+## 贡献指南
+
+1. Fork 本仓库
+2. 新建 Feat_xxx 分支
+3. 提交代码
+4. 创建 Pull Request
