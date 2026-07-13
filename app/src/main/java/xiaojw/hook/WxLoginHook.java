@@ -1072,7 +1072,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 return START_STICKY;
             }
             // 正常启动：startForeground + 根据模式选择保活策略
-            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_MANAGER_SERVICE);
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 NotificationChannel channel = new NotificationChannel(
                         FOREGROUND_CHANNEL_ID, "wxcode后台保活", NotificationManager.IMPORTANCE_LOW);
