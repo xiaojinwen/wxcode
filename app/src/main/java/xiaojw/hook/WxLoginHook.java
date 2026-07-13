@@ -62,11 +62,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     // 省电模式：true=AlarmManager 定时唤醒(省电但响应有延迟)，false=常驻 WakeLock(即时响应)
     private static volatile boolean powerSaverMode = false;
     private Application wechatApplication;
-    // 主线程(Activity 回调)写入,HTTP 线程读取,需 volatile
-    private volatile Activity fakeTopActivity;
-    private ClassLoader savedClassLoader;
-    // 仅用于 forceForegroundState/restoreForegroundState 内部传递 ForegroundDetector 原始状态
-    private boolean wasForegroundBeforeLogin = false;
 
     // 版本配置JSON
     // a1 = 1参回调(o2)实现类，构造: (LoginTask)；a7 = 2参回调(h80/j)实现类，构造: (LoginTask, o2)
@@ -172,8 +167,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             item.put("userId", userId);
             item.put("port", port);
             item.put("version", version);
-            item.put("registerTime", System.currentTimeMillis());
-            // instanceMap 已是 ConcurrentHashMap,无需额外 synchronized
             instanceMap.put(key, item);
             XposedBridge.log(TAG + " 内存注册实例: " + key + " :" + port);
         } catch (Exception e) {
@@ -259,7 +252,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private void initConfig(Context context) {
         this.appContext = context;
         if (context instanceof Application) this.wechatApplication = (Application) context;
-        hookActivityLifecycle();
         startWorkerThread();
         // 读取持久化的保活模式，确保微信重启后用户上次选择不丢失
         try {
@@ -272,107 +264,11 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         startForegroundService();
     }
 
-    /**
-     * 监听微信Activity生命周期，记录前台页面
-     */
-    private void hookActivityLifecycle() {
-        if (wechatApplication == null) return;
-        try {
-            Application.ActivityLifecycleCallbacks callback = new Application.ActivityLifecycleCallbacks() {
-                @Override
-                public void onActivityCreated(Activity activity, android.os.Bundle savedInstanceState) {}
-                @Override
-                public void onActivityStarted(Activity activity) {}
-                @Override
-                public void onActivityResumed(Activity activity) {
-                    fakeTopActivity = activity;
-                    XposedBridge.log(TAG + " [" + currentPackageName + "] 前台Activity: " + activity.getClass().getSimpleName());
-                }
-                @Override
-                public void onActivityPaused(Activity activity) {}
-                @Override
-                public void onActivityStopped(Activity activity) {}
-                @Override
-                public void onActivitySaveInstanceState(Activity activity, android.os.Bundle outState) {}
-                @Override
-                public void onActivityDestroyed(Activity activity) {
-                    if (fakeTopActivity == activity) fakeTopActivity = null;
-                }
-            };
-            wechatApplication.registerActivityLifecycleCallbacks(callback);
-            XposedBridge.log(TAG + " Activity生命周期Hook注册完成");
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " 注册生命周期回调失败: " + e.getMessage());
-        }
-    }
 
-    /**
-     * 强制伪造微信前台状态，保存原始状态
-     */
-    private void forceForegroundState(ClassLoader classLoader) {
-        XposedBridge.log(TAG + " [" + currentPackageName + "] 伪造前台状态");
-        savedClassLoader = classLoader;
-        try {
-            Class<?> foregroundClass = XposedHelpers.findClassIfExists("com.tencent.mm.sdk.platformtools.ForegroundDetector", classLoader);
-            if (foregroundClass != null) {
-                Field isForegroundField = foregroundClass.getDeclaredField("isForeground");
-                isForegroundField.setAccessible(true);
-                wasForegroundBeforeLogin = isForegroundField.getBoolean(null);
-                isForegroundField.set(null, true);
-                try {
-                    Field fgField = foregroundClass.getDeclaredField("foreground");
-                    fgField.setAccessible(true);
-                    fgField.set(null, true);
-                } catch (Exception ignored) {}
-            }
-        } catch (Exception ignored) {}
-        try {
-            Class<?> monitorClass = XposedHelpers.findClassIfExists("com.tencent.mm.sdk.platformtools.MMAppForegroundMonitor", classLoader);
-            if (monitorClass != null) {
-                Field[] fields = monitorClass.getDeclaredFields();
-                for (Field field : fields) {
-                    if (field.getName().contains("foreground")) {
-                        field.setAccessible(true);
-                        field.set(null, true);
-                    }
-                }
-            }
-        } catch (Exception ignored) {}
-    }
 
-    /**
-     * 登录完成恢复原始前台状态
-     */
-    private void restoreForegroundState() {
-        if (savedClassLoader == null) return;
-        XposedBridge.log(TAG + " 恢复原始前台状态");
-        try {
-            Class<?> foregroundClass = XposedHelpers.findClassIfExists("com.tencent.mm.sdk.platformtools.ForegroundDetector", savedClassLoader);
-            if (foregroundClass != null) {
-                Field isForegroundField = foregroundClass.getDeclaredField("isForeground");
-                isForegroundField.setAccessible(true);
-                isForegroundField.set(null, wasForegroundBeforeLogin);
-            }
-        } catch (Exception ignored) {}
-        savedClassLoader = null;
-    }
 
-    /**
-     * 判断微信当前是否前台运行
-     */
-    private boolean isWeChatForeground() {
-        if (fakeTopActivity != null && !fakeTopActivity.isFinishing()) return true;
-        try {
-            ActivityManager am = (ActivityManager) appContext.getSystemService(Context.ACTIVITY_SERVICE);
-            for (ActivityManager.RunningAppProcessInfo process : am.getRunningAppProcesses()) {
-                if (process.processName.equals(currentPackageName)) {
-                    return process.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE;
-                }
-            }
-        } catch (Exception ignored) {}
-        // 已删除 getRunningTasks 分支:Android 5.0+ 仅返回调用者自己的任务,targetSdk 33 下属死代码
-        return false;
-    }
+
+
 
     /**
      * 前台保活模式：真正启动一个前台 Service，将进程优先级提升到前台，
@@ -544,7 +440,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             // 后台时确保前台 Service 就绪，避免网络请求被 Doze 限流
             ensureForegroundForBackground();
             waitForForegroundService(1000);
-            forceForegroundState(classLoader);
             Object loginTask = XposedHelpers.newInstance(LoginTaskCls);
             setField(loginTask, "o", "login");
             setField(loginTask, "p", str);
@@ -624,7 +519,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             res[0] = "{\"err\":-500,\"msg\":\"" + msg + "\"}";
         } finally {
             isLoginInFlight.set(false);
-            restoreForegroundState();
             // 前台 Service 现为 HTTP server 常驻依赖，不在登录结束时停止
         }
         return res[0];
