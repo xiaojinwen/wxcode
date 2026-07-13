@@ -109,7 +109,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             Method myUserIdMethod = UserHandle.class.getDeclaredMethod("myUserId");
             myUserIdMethod.setAccessible(true);
             int userId = (int) myUserIdMethod.invoke(null);
-            XposedBridge.log(TAG + " [" + currentPackageName + "] UserHandle.myUserId 获取UID: " + userId);
+            // XposedBridge.log(TAG + " [" + currentPackageName + "] UserHandle.myUserId 获取UID: " + userId);
             return userId;
         } catch (Exception e1) {
             XposedBridge.log(TAG + " UserHandle.myUserId 失败: " + e1.getMessage());
@@ -154,6 +154,17 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         int port = userId < 100 ? 8088 + userId : 8200 + (userId % 100);
         XposedBridge.log(TAG + " [" + currentPackageName + "] 端口:" + port + " UID:" + userId);
         return port;
+    }
+
+    /**
+     * 检查端口是否已被占用（跨进程有效）
+     */
+    private boolean isPortInUse(int port) {
+        try (java.net.ServerSocket socket = new java.net.ServerSocket(port)) {
+            return false; // 端口可用
+        } catch (IOException e) {
+            return true; // 端口已被占用
+        }
     }
 
     /**
@@ -375,7 +386,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam loadPackageParam) throws Throwable {
         if (!isWeChatPackage(loadPackageParam.packageName)) return;
         currentPackageName = loadPackageParam.packageName;
-        XposedBridge.log(TAG + " 捕获微信包: " + currentPackageName);
         Class<?> appCls = Class.forName("android.app.Application");
         XposedHelpers.findAndHookMethod(appCls, "attach", Context.class, new XC_MethodHook() {
             @Override
@@ -385,6 +395,11 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 appContext = context;
                 currentUserId = getUserId();
                 httpPort = calculatePort(currentUserId);
+                // 检查端口是否已被占用（防止多进程重复初始化）
+                if (isPortInUse(httpPort)) {
+                    XposedBridge.log(TAG + " 端口 " + httpPort + " 已被占用，跳过初始化");
+                    return;
+                }
                 PackageInfo pkgInfo = context.getPackageManager().getPackageInfo(currentPackageName, 0);
                 versionName = pkgInfo.versionName;
                 XposedBridge.log(TAG + " [" + currentPackageName + "] UID:" + currentUserId + " Ver:" + versionName + " Port:" + httpPort);
