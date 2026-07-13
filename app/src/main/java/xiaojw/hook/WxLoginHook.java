@@ -98,7 +98,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
 
     // 内存实例表：跨用户实例通过向主端口注册通知汇聚，无需共享文件系统即可多用户共享
     private static final java.util.Map<String, JSONObject> instanceMap = new java.util.concurrent.ConcurrentHashMap<>();
-    private Thread heartbeatThread;
 
     /**
      * 判断是否微信包名（系统分身与主应用包名相同）
@@ -183,24 +182,19 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 读取内存实例表并清理5分钟过期的实例
+     * 读取内存实例表，实例注册后不会过期，跟随微信生命周期
      */
     private JSONArray getMemoryInstances() {
         // ConcurrentHashMap 的迭代器支持并发修改且弱一致,无需额外 synchronized
-        long now = System.currentTimeMillis();
         JSONArray result = new JSONArray();
         java.util.Iterator<java.util.Map.Entry<String, JSONObject>> it = instanceMap.entrySet().iterator();
         while (it.hasNext()) {
             java.util.Map.Entry<String, JSONObject> entry = it.next();
             try {
                 JSONObject item = entry.getValue();
-                if (now - item.getLong("registerTime") < 300000) {
-                    result.put(item);
-                } else {
-                    it.remove();
-                }
+                result.put(item);
             } catch (Exception e) {
-                it.remove();
+                // 忽略异常数据
             }
         }
         return result;
@@ -231,43 +225,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         }).start();
     }
 
-    /**
-     * 定时续期实例存活：主端口刷新自己的 registerTime，非主端口向主端口重新注册。
-     * 否则 getMemoryInstances() 按 5 分钟过期清理后，/instances 会返回空列表。
-     */
-    private void startHeartbeat() {
-        if (heartbeatThread != null && heartbeatThread.isAlive()) return;
-        heartbeatThread = new Thread(() -> {
-            while (!Thread.currentThread().isInterrupted()) {
-                try {
-                    Thread.sleep(60000);
-                    if (httpPort == MASTER_PORT) {
-                        registerInstanceInMemory(currentPackageName, currentUserId, httpPort, versionName);
-                    } else {
-                        notifyMasterRegister(httpPort, currentUserId, versionName);
-                    }
-                } catch (InterruptedException e) {
-                    break;
-                }
-            }
-        }, "wxcode-heartbeat");
-        heartbeatThread.setDaemon(true);
-        heartbeatThread.start();
-        XposedBridge.log(TAG + " 心跳线程启动");
-    }
 
-    /**
-     * 执行一次心跳续期（供 AlarmManager 省电模式回调使用）。
-     * 主端口刷新自己的 registerTime，非主端口向主端口重新注册。
-     */
-    private static void performHeartbeat() {
-        if (httpPort == MASTER_PORT) {
-            registerInstanceInMemory(currentPackageName, currentUserId, httpPort, versionName);
-        } else {
-            notifyMasterRegister(httpPort, currentUserId, versionName);
-        }
-        XposedBridge.log(TAG + " AlarmManager 心跳续期完成");
-    }
 
     /**
      * 非主端口实例：从主端口拉取汇总后的实例列表
@@ -556,8 +514,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     } else {
                         XposedBridge.log(TAG + " 当前即主端口(8088)，负责汇总所有实例");
                     }
-                    // 所有实例都启动心跳续期，避免被 5 分钟过期清理
-                    startHeartbeat();
                     initConfig(context);
                 } catch (IOException e) {
                     XposedBridge.log(TAG + " HTTP服务启动失败:" + e.getMessage());
@@ -1211,19 +1167,18 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         public int onStartCommand(Intent intent, int flags, int startId) {
             boolean isAlarmTrigger = intent != null && intent.getBooleanExtra(EXTRA_ALARM_TRIGGER, false);
             if (isAlarmTrigger) {
-                // 闹钟触发：acquire 短时 wakeLock(10s 自动释放)，执行心跳续期 + 重新注册闹钟
+                // 闹钟触发：acquire 短时 wakeLock(10s 自动释放)
                 // 不 stopSelf：保持 Service 前台运行，进程优先级不降，只是 CPU 休眠省电
                 try {
                     PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-                    PowerManager.WakeLock alarmWl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wxcode:alarm_heartbeat");
+                    PowerManager.WakeLock alarmWl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wxcode:alarm_wakeup");
                     alarmWl.acquire(10000);
-                    performHeartbeat();
                     scheduleNextAlarm();
                 } catch (Throwable ignored) {}
                 return START_STICKY;
             }
             // 正常启动：startForeground + 根据模式选择保活策略
-            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_MANAGER_SERVICE);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 NotificationChannel channel = new NotificationChannel(
                         FOREGROUND_CHANNEL_ID, "wxcode后台保活", NotificationManager.IMPORTANCE_LOW);
