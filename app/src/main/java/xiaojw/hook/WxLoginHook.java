@@ -8,6 +8,7 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
+import android.content.pm.ServiceInfo;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Handler;
@@ -68,13 +69,13 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     // 8.0.76 起 h2/l2 混淆位移：h2->i2(a1)、l2->m2(a7)，构造函数签名随版本变化，故均纳入配置
     private String jsonString = """
         {
-            "8.0.49": {"j1": "u70.k1", "c": "o60.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
+            "8.0.49": {"j1": "u70.k1", "c": "o60.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.i2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.m2"},
             "8.0.62": {"j1": "of0.j1", "c": "he0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
             "8.0.70": {"j1": "yj0.j1", "c": "ti0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
             "8.0.71": {"j1": "tk0.j1", "c": "oj0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
             "8.0.72": {"j1": "dl0.k1", "c": "yj0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
             "8.0.74": {"j1": "gm0.j1", "c": "bl0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
-            "8.0.76": {"j1": "hm0.j1", "c": "ccl0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.i2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.m2"}
+            "8.0.76": {"j1": "hm0.j1", "c": "cl0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.i2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.m2"}
         }""";
 
     private String j1 = "of0.j1";
@@ -275,12 +276,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         startForegroundService();
     }
 
-
-
-
-
-
-
     /**
      * 前台保活模式：真正启动一个前台 Service，将进程优先级提升到前台，
      * 从而绕过系统对后台应用的网络限流/Doze延迟，并规避"后台启动Activity被拦截"的问题。
@@ -385,6 +380,11 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam loadPackageParam) throws Throwable {
         if (!isWeChatPackage(loadPackageParam.packageName)) return;
+        // 只在主进程初始化，子进程（如 :tools、:appbrand 等）跳过
+        String processName = loadPackageParam.processName;
+        if (!loadPackageParam.packageName.equals(processName)) {
+            return;
+        }
         currentPackageName = loadPackageParam.packageName;
         Class<?> appCls = Class.forName("android.app.Application");
         XposedHelpers.findAndHookMethod(appCls, "attach", Context.class, new XC_MethodHook() {
@@ -1095,16 +1095,29 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 channel.setShowBadge(false);
                 nm.createNotificationChannel(channel);
             }
-            Notification notification = new Notification.Builder(this)
-                    .setContentTitle("wxcode 服务运行中")
-                    .setContentText(powerSaverMode ? "省电模式：定时唤醒保活" : "性能模式：常驻保活中")
-                    .setSmallIcon(android.R.drawable.ic_dialog_info)
-                    .setPriority(Notification.PRIORITY_LOW)
-                    .setOngoing(true)
-                    .setChannelId(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? FOREGROUND_CHANNEL_ID : null)
-                    .build();
+            Notification notification;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                notification = new Notification.Builder(this, FOREGROUND_CHANNEL_ID)
+                        .setContentTitle("wxcode 服务运行中")
+                        .setContentText(powerSaverMode ? "省电模式：定时唤醒保活" : "性能模式：常驻保活中")
+                        .setSmallIcon(android.R.drawable.ic_dialog_info)
+                        .setOngoing(true)
+                        .build();
+            } else {
+                notification = new Notification.Builder(this)
+                        .setContentTitle("wxcode 服务运行中")
+                        .setContentText(powerSaverMode ? "省电模式：定时唤醒保活" : "性能模式：常驻保活中")
+                        .setSmallIcon(android.R.drawable.ic_dialog_info)
+                        .setOngoing(true)
+                        .build();
+            }
             try {
-                startForeground(FOREGROUND_NOTIF_ID, notification);
+                // Android 14+ 需要指定前台服务类型
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    startForeground(FOREGROUND_NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                } else {
+                    startForeground(FOREGROUND_NOTIF_ID, notification);
+                }
                 fgServiceActive = true;
                 cancelAlarm();
                 if (powerSaverMode) {
@@ -1133,7 +1146,12 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             intent.putExtra(EXTRA_ALARM_TRIGGER, true);
             int flags = PendingIntent.FLAG_UPDATE_CURRENT;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) flags |= PendingIntent.FLAG_IMMUTABLE;
-            alarmPendingIntent = PendingIntent.getService(this, 1002, intent, flags);
+            // Android 11+ 使用 getForegroundService，之前版本使用 getService
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                alarmPendingIntent = PendingIntent.getForegroundService(this, 1002, intent, flags);
+            } else {
+                alarmPendingIntent = PendingIntent.getService(this, 1002, intent, flags);
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
                         SystemClock.elapsedRealtime() + ALARM_INTERVAL_MS, alarmPendingIntent);

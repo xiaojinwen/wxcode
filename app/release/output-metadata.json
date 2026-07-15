@@ -11,9 +11,9 @@
       "type": "SINGLE",
       "filters": [],
       "attributes": [],
-      "versionCode": 7,
-      "versionName": "2.0.5",
-      "outputFile": "app-release.apk"
+      "versionCode": 8,
+      "versionName": "2.0.6",
+      "outputFile": "wxcode_2.0.6.apk"
     }
   ],
   "elementType": "File",
