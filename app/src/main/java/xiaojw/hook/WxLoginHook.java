@@ -64,12 +64,18 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private static volatile boolean powerSaverMode = false;
     private Application wechatApplication;
 
-    // 版本配置JSON
+    // 版本配置JSON（内置默认配置）
     // a1 = 1参回调(o2)实现类，构造: (LoginTask)；a7 = 2参回调(h80/j)实现类，构造: (LoginTask, o2)
     // 8.0.76 起 h2/l2 混淆位移：h2->i2(a1)、l2->m2(a7)，构造函数签名随版本变化，故均纳入配置
+    // 
+    // 8.0.49 配置来源：通过 jadx 反编译分析 JsApiLogin$LoginTask.java
+    // - j1=u70.k1: 第185行 u70.k1.d().f(cVar)
+    // - c=o60.c: 第179行 o60.c cVar = new o60.c(...)
+    // - a1=b2: 第167行 b2 b2Var = new b2(this)
+    // - a7=f2: 第177行 f2 f2Var = new f2(this, b2Var)
     private String jsonString = """
         {
-            "8.0.49": {"j1": "u70.k1", "c": "o60.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.i2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.m2"},
+            "8.0.49": {"j1": "u70.k1", "c": "o60.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.b2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.f2"},
             "8.0.62": {"j1": "of0.j1", "c": "he0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
             "8.0.70": {"j1": "yj0.j1", "c": "ti0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
             "8.0.71": {"j1": "tk0.j1", "c": "oj0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
@@ -128,7 +134,10 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + " Process.myUserHandle 失败: " + e2.getMessage());
         }
         try {
-            String dataDir = appContext.getDataDir() != null ? appContext.getDataDir().getAbsolutePath() : null;
+            String dataDir = null;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                dataDir = appContext.getDataDir() != null ? appContext.getDataDir().getAbsolutePath() : null;
+            }
             if (dataDir != null && dataDir.contains("/data/user/")) {
                 String[] parts = dataDir.split("/");
                 if (parts.length >= 4 && "data".equals(parts[1]) && "user".equals(parts[2])) {
@@ -271,6 +280,14 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     .getBoolean("power_saver_mode", false);
             XposedBridge.log(TAG + " 保活模式: " + (powerSaverMode ? "省电模式" : "性能模式"));
         } catch (Exception ignored) {}
+        // 读取持久化的调试模式
+        try {
+            debugMode = appContext.getSharedPreferences("wxcode_prefs", Context.MODE_PRIVATE)
+                    .getBoolean("debug_mode", false);
+            if (debugMode) {
+                XposedBridge.log(TAG + " 调试模式: 开启");
+            }
+        } catch (Exception ignored) {}
         // 进程级常驻：HTTP server 启动即拉起前台 Service，确保所有 HTTP 线程
         // （含 NanoHTTPD accept）始终受前台优先级保护，不被 Doze 限流。
         startForegroundService();
@@ -373,7 +390,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         workerThread = null;
         workerHandler = null;
         if (ht != null) {
-            ht.quitSafely();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
+                ht.quitSafely();
+            }
         }
     }
 
@@ -403,6 +422,14 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 PackageInfo pkgInfo = context.getPackageManager().getPackageInfo(currentPackageName, 0);
                 versionName = pkgInfo.versionName;
                 XposedBridge.log(TAG + " [" + currentPackageName + "] UID:" + currentUserId + " Ver:" + versionName + " Port:" + httpPort);
+                
+                // 优先从外部文件加载配置
+                String externalConfig = loadConfigFromFile();
+                if (externalConfig != null) {
+                    jsonString = externalConfig;
+                    XposedBridge.log(TAG + " 使用外部配置文件");
+                }
+                
                 try {
                     JSONObject verCfg = new JSONObject(jsonString).getJSONObject(versionName);
                     j1 = verCfg.getString("j1");
@@ -562,15 +589,19 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      */
     private Constructor<?> findHe0cConstructor(Class<?> clazz) {
         for (Constructor<?> c : clazz.getDeclaredConstructors()) {
-            if (c.getParameterCount() == 8) {
-                c.setAccessible(true);
-                return c;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (c.getParameterCount() == 8) {
+                    c.setAccessible(true);
+                    return c;
+                }
             }
         }
         for (Constructor<?> c : clazz.getDeclaredConstructors()) {
-            if (c.getParameterCount() >= 6) {
-                c.setAccessible(true);
-                return c;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (c.getParameterCount() >= 6) {
+                    c.setAccessible(true);
+                    return c;
+                }
             }
         }
         throw new RuntimeException("未找到目标构造函数:" + clazz.getName());
@@ -695,8 +726,14 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 try {
                     String portStr = iHTTPSession.getParms().get("port");
                     String userIdStr = iHTTPSession.getParms().get("userId");
-                    String ver = iHTTPSession.getParms().getOrDefault("version", "");
-                    String pkg = iHTTPSession.getParms().getOrDefault("packageName", "com.tencent.mm");
+                    String ver = null;
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        ver = iHTTPSession.getParms().getOrDefault("version", "");
+                    }
+                    String pkg = null;
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        pkg = iHTTPSession.getParms().getOrDefault("packageName", "com.tencent.mm");
+                    }
                     if (portStr != null && userIdStr != null) {
                         outer.registerInstanceInMemory(pkg, Integer.parseInt(userIdStr), Integer.parseInt(portStr), ver);
                         JSONObject r = new JSONObject();
@@ -744,7 +781,10 @@ public class WxLoginHook implements IXposedHookLoadPackage {
 
             // /config 接口：查看/切换保活模式
             if (uri.equals("/config")) {
-                String mode = iHTTPSession.getParms().getOrDefault("mode", "");
+                String mode = null;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    mode = iHTTPSession.getParms().getOrDefault("mode", "");
+                }
                 if ("performance".equals(mode) || "power_saver".equals(mode)) {
                     outer.switchPowerMode("power_saver".equals(mode));
                 }
@@ -760,7 +800,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
 
             // /login 接口：执行登录（后台唤醒逻辑已由 doLogin 内部按需处理）
             if (uri.equals("/login")) {
-                return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", outer.doLogin(iHTTPSession.getParms().getOrDefault("appId", DEFAULT_AUTO_APP_ID), classLoader));
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    return NanoHTTPD.newFixedLengthResponse(Response.Status.OK, "application/json", outer.doLogin(iHTTPSession.getParms().getOrDefault("appId", DEFAULT_AUTO_APP_ID), classLoader));
+                }
             }
 
             // 首页HTML页面
@@ -1043,7 +1085,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 sb.append("</table>");
                 sb.append("</div>");
                 sb.append("<div class='footer'>");
-                sb.append("© 2026 wxcode 插件 | 服务器时间：").append(LocalDateTime.now()).append("");
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    sb.append("© 2026 wxcode 插件 | 服务器时间：").append(LocalDateTime.now()).append("");
+                }
                 sb.append("</div>");
                 sb.append("</div>");
                 sb.append("</body>");
@@ -1113,7 +1157,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             }
             try {
                 // Android 14+ 需要指定前台服务类型
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     startForeground(FOREGROUND_NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
                 } else {
                     startForeground(FOREGROUND_NOTIF_ID, notification);
