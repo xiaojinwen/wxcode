@@ -67,27 +67,33 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     // 版本配置JSON（内置默认配置）
     // a1 = 1参回调(o2)实现类，构造: (LoginTask)；a7 = 2参回调(h80/j)实现类，构造: (LoginTask, o2)
     // 8.0.76 起 h2/l2 混淆位移：h2->i2(a1)、l2->m2(a7)，构造函数签名随版本变化，故均纳入配置
-    // 
+    //
     // 8.0.49 配置来源：通过 jadx 反编译分析 JsApiLogin$LoginTask.java
     // - j1=u70.k1: 第185行 u70.k1.d().f(cVar)
     // - c=o60.c: 第179行 o60.c cVar = new o60.c(...)
     // - a1=b2: 第167行 b2 b2Var = new b2(this)
     // - a7=f2: 第177行 f2 f2Var = new f2(this, b2Var)
+    //
+    // 配置合并策略：先加载 common 公共配置，再用版本特定配置覆盖
     private String jsonString = """
         {
-            "8.0.49": {"j1": "u70.k1", "c": "o60.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.b2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.f2"},
-            "8.0.62": {"j1": "of0.j1", "c": "he0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
-            "8.0.70": {"j1": "yj0.j1", "c": "ti0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
-            "8.0.71": {"j1": "tk0.j1", "c": "oj0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
-            "8.0.72": {"j1": "dl0.k1", "c": "yj0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
-            "8.0.74": {"j1": "gm0.j1", "c": "bl0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.h2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.l2"},
-            "8.0.76": {"j1": "hm0.j1", "c": "cl0.c", "a1": "com.tencent.mm.plugin.appbrand.jsapi.auth.i2", "a7": "com.tencent.mm.plugin.appbrand.jsapi.auth.m2"}
+            "common": {"j1_static_method": "d", "j1_instance_method": "g"},
+            "8.0.49": {"j1": "u70.k1", "c": "o60.c", "a1": "plugin.appbrand.jsapi.auth.b2", "a7": "plugin.appbrand.jsapi.auth.f2", "j1_instance_method": "f"},
+            "8.0.62": {"j1": "of0.j1", "c": "he0.c", "a1": "plugin.appbrand.jsapi.auth.h2", "a7": "plugin.appbrand.jsapi.auth.l2"},
+            "8.0.70": {"j1": "yj0.j1", "c": "ti0.c", "a1": "plugin.appbrand.jsapi.auth.h2", "a7": "plugin.appbrand.jsapi.auth.l2"},
+            "8.0.71": {"j1": "tk0.j1", "c": "oj0.c", "a1": "plugin.appbrand.jsapi.auth.h2", "a7": "plugin.appbrand.jsapi.auth.l2"},
+            "8.0.72": {"j1": "dl0.k1", "c": "yj0.c", "a1": "plugin.appbrand.jsapi.auth.h2", "a7": "plugin.appbrand.jsapi.auth.l2"},
+            "8.0.74": {"j1": "gm0.j1", "c": "bl0.c", "a1": "plugin.appbrand.jsapi.auth.h2", "a7": "plugin.appbrand.jsapi.auth.l2"},
+            "8.0.76": {"j1": "hm0.j1", "c": "cl0.c", "a1": "plugin.appbrand.jsapi.auth.i2", "a7": "plugin.appbrand.jsapi.auth.m2"}
         }""";
 
     private String j1 = "of0.j1";
     private String c = "he0.c";
-    private String a1 = "com.tencent.mm.plugin.appbrand.jsapi.auth.h2";
-    private String a7 = "com.tencent.mm.plugin.appbrand.jsapi.auth.l2";
+    private String a1 = "plugin.appbrand.jsapi.auth.h2";
+    private String a7 = "plugin.appbrand.jsapi.auth.l2";
+    private static final String COMMON_PACKAGE = "com.tencent.mm";
+    private String j1StaticMethod = "d";
+    private String j1InstanceMethod = "g";
     private static volatile String versionName = "000";
     private static volatile String currentPackageName = "";
     private static volatile int currentUserId = 0;
@@ -280,14 +286,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     .getBoolean("power_saver_mode", false);
             XposedBridge.log(TAG + " 保活模式: " + (powerSaverMode ? "省电模式" : "性能模式"));
         } catch (Exception ignored) {}
-        // 读取持久化的调试模式
-        try {
-            debugMode = appContext.getSharedPreferences("wxcode_prefs", Context.MODE_PRIVATE)
-                    .getBoolean("debug_mode", false);
-            if (debugMode) {
-                XposedBridge.log(TAG + " 调试模式: 开启");
-            }
-        } catch (Exception ignored) {}
         // 进程级常驻：HTTP server 启动即拉起前台 Service，确保所有 HTTP 线程
         // （含 NanoHTTPD accept）始终受前台优先级保护，不被 Doze 限流。
         startForegroundService();
@@ -423,22 +421,31 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 versionName = pkgInfo.versionName;
                 XposedBridge.log(TAG + " [" + currentPackageName + "] UID:" + currentUserId + " Ver:" + versionName + " Port:" + httpPort);
                 
-                // 优先从外部文件加载配置
-                String externalConfig = loadConfigFromFile();
-                if (externalConfig != null) {
-                    jsonString = externalConfig;
-                    XposedBridge.log(TAG + " 使用外部配置文件");
-                }
-                
                 try {
-                    JSONObject verCfg = new JSONObject(jsonString).getJSONObject(versionName);
-                    j1 = verCfg.getString("j1");
-                    c = verCfg.getString("c");
-                    a1 = verCfg.optString("a1", a1);
-                    a7 = verCfg.optString("a7", a7);
-                    XposedBridge.log(TAG + " 版本配置加载成功: " + verCfg);
+                    JSONObject rootCfg = new JSONObject(jsonString);
+                    // 先加载公共配置
+                    JSONObject commonCfg = rootCfg.optJSONObject("common");
+                    if (commonCfg != null) {
+                        j1StaticMethod = commonCfg.optString("j1_static_method", j1StaticMethod);
+                        j1InstanceMethod = commonCfg.optString("j1_instance_method", j1InstanceMethod);
+                        XposedBridge.log(TAG + " 公共配置加载成功: " + commonCfg);
+                    }
+                    // 再加载版本特定配置（覆盖公共配置）
+                    JSONObject verCfg = rootCfg.optJSONObject(versionName);
+                    if (verCfg != null) {
+                        j1 = verCfg.optString("j1", j1);
+                        c = verCfg.optString("c", c);
+                        a1 = verCfg.optString("a1", a1);
+                        a7 = verCfg.optString("a7", a7);
+                        // 版本配置可覆盖公共配置中的方法名
+                        j1StaticMethod = verCfg.optString("j1_static_method", j1StaticMethod);
+                        j1InstanceMethod = verCfg.optString("j1_instance_method", j1InstanceMethod);
+                        XposedBridge.log(TAG + " 版本配置加载成功: " + verCfg);
+                    } else {
+                        XposedBridge.log(TAG + " 版本配置不存在，使用默认配置");
+                    }
                 } catch (Exception e) {
-                    XposedBridge.log(TAG + " 版本配置不存在: " + e.getMessage());
+                    XposedBridge.log(TAG + " 版本配置加载失败: " + e.getMessage());
                 }
                 try {
                     httpServer = new LoginHttpServer(WxLoginHook.this, httpPort, classLoader);
@@ -473,11 +480,11 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             final long timeoutMs = 30000;
             XposedBridge.log(TAG + " doLogin 前台Service运行=" + isForegroundServiceRunning + " 超时=" + timeoutMs + "ms");
             Class<?> LoginTaskCls = XposedHelpers.findClass("com.tencent.mm.plugin.appbrand.jsapi.auth.JsApiLogin$LoginTask", classLoader);
-            Class<?> h2Cls = XposedHelpers.findClass(this.a1, classLoader);
-            Class<?> l2Cls = XposedHelpers.findClass(this.a7, classLoader);
+            Class<?> h2Cls = XposedHelpers.findClass(COMMON_PACKAGE + "." + this.a1, classLoader);
+            Class<?> l2Cls = XposedHelpers.findClass(COMMON_PACKAGE + "." + this.a7, classLoader);
             Class<?> cCls = XposedHelpers.findClass(this.c, classLoader);
             Class<?> j1Cls = XposedHelpers.findClass(this.j1, classLoader);
-            XposedBridge.log(TAG + " a1=" + this.a1 + " a7=" + this.a7);
+            XposedBridge.log(TAG + " a1=" + COMMON_PACKAGE + "." + this.a1 + " a7=" + COMMON_PACKAGE + "." + this.a7);
             XposedBridge.log(TAG + " 发起登录 appId=" + str);
             // 后台时确保前台 Service 就绪，避免网络请求被 Doze 限流
             ensureForegroundForBackground();
@@ -495,7 +502,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             Object h2Obj = h2Ctor.newInstance(loginTask);
             Object l2Obj = XposedHelpers.newInstance(l2Cls, loginTask, h2Obj);
             Object cObj = ctor.newInstance(str, new LinkedList<>(), 1, "", "", 0, 1271, l2Obj);
-            XposedHelpers.callMethod(XposedHelpers.callStaticMethod(j1Cls, "d"), "g", cObj);
+            XposedHelpers.callMethod(XposedHelpers.callStaticMethod(j1Cls, j1StaticMethod), j1InstanceMethod, cObj);
             long start = System.currentTimeMillis();
             Handler handler;
             // 单一策略：子线程轮询，未就绪则重建，主线程兜底
@@ -713,8 +720,10 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     info.put("version", outer.versionName);
                     info.put("j1", outer.j1);
                     info.put("c", outer.c);
-                    info.put("a1", outer.a1);
-                    info.put("a7", outer.a7);
+                    info.put("a1", COMMON_PACKAGE + "." + outer.a1);
+                    info.put("a7", COMMON_PACKAGE + "." + outer.a7);
+                    info.put("j1StaticMethod", outer.j1StaticMethod);
+                    info.put("j1InstanceMethod", outer.j1InstanceMethod);
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", info.toString());
                 } catch (Exception e) {
                     return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "application/json", "{\"err\":-500,\"msg\":\"" + e.getMessage() + "\"}");
@@ -1039,6 +1048,21 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 sb.append("<tr><td>系统分身(小米等)</td><td><code>com.tencent.mm (User 999)</code></td><td>8299</td></tr>");
                 sb.append("</tbody></table>");
                 sb.append("<p>💡 提示：系统分身包名均为 <code>com.tencent.mm</code>。所有分身启动后向主端口(用户0的<code>8088</code>)发送注册通知，由主端口汇总所有端口；访问任意实例的 <a href='/instances'>/instances</a> 即可看到全部（主端口<code>role=master</code>，其余<code>slave</code>）。跨用户共享依赖<code>127.0.0.1</code>互通（多数系统分身满足）。</p>");
+
+                // 显示公共配置
+                JSONObject commonConfig = jSONObject.optJSONObject("common");
+                if (commonConfig != null) {
+                    sb.append("<h2>⚙️ 公共配置</h2>");
+                    sb.append("<table>");
+                    sb.append("<thead><tr><th>配置项</th><th>值</th></tr></thead>");
+                    sb.append("<tbody>");
+                    sb.append("<tr><td><code>j1_static_method</code></td><td class='code'>").append(commonConfig.optString("j1_static_method", "-")).append("</td></tr>");
+                    sb.append("<tr><td><code>j1_instance_method</code></td><td class='code'>").append(commonConfig.optString("j1_instance_method", "-")).append("</td></tr>");
+                    sb.append("<tr><td><code>COMMON_PACKAGE</code></td><td class='code'>").append(COMMON_PACKAGE).append("</td></tr>");
+                    sb.append("</tbody></table>");
+                    sb.append("<p style='color:#666;font-size:0.9em;'>💡 公共配置为所有版本提供默认值，版本配置可覆盖公共配置</p>");
+                }
+
                 sb.append("<h2>📋 适配版本列表</h2>");
                 sb.append("<div class='version-scroll'>");
                 sb.append("<table>");
@@ -1049,13 +1073,16 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 sb.append("<th>c 参数</th>");
                 sb.append("<th>a1 (h2→1参)</th>");
                 sb.append("<th>a7 (l2→2参)</th>");
+                sb.append("<th>覆盖配置</th>");
                 sb.append("</tr>");
                 sb.append("</thead>");
                 // 计算所有 a1/a7 的公共前缀，展示时省略只保留尾部不同的类名段
                 java.util.List<String> classNames = new java.util.ArrayList<>();
                 Iterator<String> preIt = jSONObject.keys();
                 while (preIt.hasNext()) {
-                    JSONObject o = jSONObject.getJSONObject(preIt.next());
+                    String key = preIt.next();
+                    if ("common".equals(key)) continue; // 跳过公共配置
+                    JSONObject o = jSONObject.getJSONObject(key);
                     String a = o.optString("a1", "");
                     String b = o.optString("a7", "");
                     if (a.contains(".")) classNames.add(a);
@@ -1066,6 +1093,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 Iterator<String> itKeys = jSONObject.keys();
                 while (itKeys.hasNext()) {
                     String next = itKeys.next();
+                    if ("common".equals(next)) continue; // 跳过公共配置
                     JSONObject jSONObject2 = jSONObject.getJSONObject(next);
                     String string = jSONObject2.getString("j1");
                     String string2 = jSONObject2.getString("c");
@@ -1073,12 +1101,25 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     String a7Full = jSONObject2.optString("a7", "-");
                     String stringA1 = shortenClass(a1Full, aPrefix);
                     String stringA7 = shortenClass(a7Full, aPrefix);
+
+                    // 检查覆盖的配置
+                    StringBuilder overrideConfig = new StringBuilder();
+                    if (jSONObject2.has("j1_static_method")) {
+                        overrideConfig.append("j1_static_method=").append(jSONObject2.getString("j1_static_method"));
+                    }
+                    if (jSONObject2.has("j1_instance_method")) {
+                        if (overrideConfig.length() > 0) overrideConfig.append("<br>");
+                        overrideConfig.append("j1_instance_method=").append(jSONObject2.getString("j1_instance_method"));
+                    }
+                    String overrideDisplay = overrideConfig.length() > 0 ? overrideConfig.toString() : "<span style='color:#999'>-</span>";
+
                     sb.append("<tr>");
                     sb.append("<td class='version'>").append(next).append("</td>");
                     sb.append("<td class='code'>").append(string).append("</td>");
                     sb.append("<td class='code'>").append(string2).append("</td>");
                     sb.append("<td class='code' title='").append(a1Full).append("'>").append(stringA1).append("</td>");
                     sb.append("<td class='code' title='").append(a7Full).append("'>").append(stringA7).append("</td>");
+                    sb.append("<td class='code'>").append(overrideDisplay).append("</td>");
                     sb.append("</tr>");
                 }
                 sb.append("</tbody>");
