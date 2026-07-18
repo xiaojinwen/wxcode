@@ -91,6 +91,8 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private String c = "he0.c";
     private String a1 = "plugin.appbrand.jsapi.auth.h2";
     private String a7 = "plugin.appbrand.jsapi.auth.l2";
+    // 内置默认配置原文，永不修改——用于与用户持久化配置合并
+    private String defaultConfigJson;
     private static final String COMMON_PACKAGE = "com.tencent.mm";
     private String j1StaticMethod = "d";
     private String j1InstanceMethod = "g";
@@ -286,6 +288,24 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     .getBoolean("power_saver_mode", false);
             XposedBridge.log(TAG + " 保活模式: " + (powerSaverMode ? "省电模式" : "性能模式"));
         } catch (Exception ignored) {}
+        // 记录内置默认配置原文，用于后续合并（确保内置更新不被覆盖）
+        defaultConfigJson = jsonString;
+        // 读取持久化的版本配置（用户自行新增的版本适配），与内置默认配置合并
+        try {
+            String savedConfig = appContext.getSharedPreferences("wxcode_config", Context.MODE_PRIVATE)
+                    .getString("version_config", null);
+            if (savedConfig != null && !savedConfig.isEmpty()) {
+                JSONObject baseCfg = new JSONObject(defaultConfigJson);
+                JSONObject userCfg = new JSONObject(savedConfig);
+                Iterator<String> keys = userCfg.keys();
+                while (keys.hasNext()) {
+                    String key = keys.next();
+                    baseCfg.put(key, userCfg.get(key));
+                }
+                jsonString = baseCfg.toString();
+                XposedBridge.log(TAG + " 已合并持久化的版本配置（用户配置覆盖/追加到内置默认配置之上）");
+            }
+        } catch (Exception ignored) {}
         // 进程级常驻：HTTP server 启动即拉起前台 Service，确保所有 HTTP 线程
         // （含 NanoHTTPD accept）始终受前台优先级保护，不被 Doze 限流。
         startForegroundService();
@@ -322,6 +342,31 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             appContext.stopService(new Intent(appContext, KeepAliveService.class));
         } catch (Exception ignored) {}
         isForegroundServiceRunning = false;
+    }
+
+    /**
+     * 保存版本配置到 SharedPreferences（持久化），类似保活模式的保存方式
+     * 只保存用户提供的配置，启动时再与内置默认配置合并
+     */
+    private void saveConfig(String userConfigJson) {
+        try {
+            // 校验 JSON 格式
+            JSONObject userCfg = new JSONObject(userConfigJson);
+            appContext.getSharedPreferences("wxcode_config", Context.MODE_PRIVATE)
+                    .edit().putString("version_config", userConfigJson).apply();
+            // 与内置默认配置合并（defaultConfigJson），确保内置版本更新不被覆盖
+            String baseStr = defaultConfigJson != null ? defaultConfigJson : jsonString;
+            JSONObject merged = new JSONObject(baseStr);
+            Iterator<String> keys = userCfg.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                merged.put(key, userCfg.get(key));
+            }
+            jsonString = merged.toString();
+            XposedBridge.log(TAG + " 版本配置已持久化保存（当前内存中为合并结果）");
+        } catch (Exception e) {
+            XposedBridge.log(TAG + " 保存版本配置失败: " + e.getMessage());
+        }
     }
 
     /**
@@ -807,6 +852,105 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 }
             }
 
+            // /config_raw 接口：返回格式化后的版本配置 JSON 文本（供在线编辑使用）
+            if (uri.equals("/config_raw")) {
+                try {
+                    String prettyJson = new JSONObject(outer.jsonString).toString(2);
+                    return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json; charset=utf-8", prettyJson);
+                } catch (Exception e) {
+                    return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json; charset=utf-8", outer.jsonString);
+                }
+            }
+
+            // /save_config 接口：新增或更新版本配置（持久化保存，类似保活模式的保存方式）
+            if (uri.equals("/save_config")) {
+                try {
+                    String action = null;
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        action = iHTTPSession.getParms().getOrDefault("action", "");
+                    }
+                    if ("save".equals(action)) {
+                        // 新增/更新：接收完整 jsonString（含所有版本配置）
+                        String configStr = null;
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                            configStr = iHTTPSession.getParms().getOrDefault("config", "");
+                        }
+                        if (configStr != null && !configStr.isEmpty()) {
+                            outer.saveConfig(configStr);
+                            JSONObject r = new JSONObject();
+                            r.put("success", true);
+                            r.put("msg", "配置已保存");
+                            return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", r.toString());
+                        }
+                        return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.BAD_REQUEST, "application/json", "{\"err\":-1,\"msg\":\"缺少config参数\"}");
+                    } else if ("add_version".equals(action)) {
+                        // 在现有配置中添加/更新一个版本条目
+                        String version = null;
+                        String j1Val = null;
+                        String cVal = null;
+                        String a1Val = null;
+                        String a7Val = null;
+                        String j1Static = null;
+                        String j1Instance = null;
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                            version = iHTTPSession.getParms().getOrDefault("version", "");
+                            j1Val = iHTTPSession.getParms().getOrDefault("j1", "");
+                            cVal = iHTTPSession.getParms().getOrDefault("c", "");
+                            a1Val = iHTTPSession.getParms().getOrDefault("a1", "");
+                            a7Val = iHTTPSession.getParms().getOrDefault("a7", "");
+                            j1Static = iHTTPSession.getParms().getOrDefault("j1_static_method", "");
+                            j1Instance = iHTTPSession.getParms().getOrDefault("j1_instance_method", "");
+                        }
+                        if (version != null && !version.isEmpty() && j1Val != null && !j1Val.isEmpty() && cVal != null && !cVal.isEmpty()) {
+                            JSONObject rootCfg = new JSONObject(outer.jsonString);
+                            JSONObject verObj = new JSONObject();
+                            verObj.put("j1", j1Val);
+                            verObj.put("c", cVal);
+                            if (a1Val != null && !a1Val.isEmpty()) verObj.put("a1", a1Val);
+                            if (a7Val != null && !a7Val.isEmpty()) verObj.put("a7", a7Val);
+                            if (j1Static != null && !j1Static.isEmpty()) verObj.put("j1_static_method", j1Static);
+                            if (j1Instance != null && !j1Instance.isEmpty()) verObj.put("j1_instance_method", j1Instance);
+                            rootCfg.put(version, verObj);
+                            outer.saveConfig(rootCfg.toString());
+                            JSONObject r = new JSONObject();
+                            r.put("success", true);
+                            r.put("msg", "版本 " + version + " 配置已" + (rootCfg.has(version) ? "更新" : "新增"));
+                            return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", r.toString());
+                        }
+                        return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.BAD_REQUEST, "application/json", "{\"err\":-1,\"msg\":\"缺少必要参数(version/j1/c)\"}");
+                    } else if ("delete_version".equals(action)) {
+                        String version = null;
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                            version = iHTTPSession.getParms().getOrDefault("version", "");
+                        }
+                        if (version != null && !version.isEmpty()) {
+                            JSONObject rootCfg = new JSONObject(outer.jsonString);
+                            if (rootCfg.has(version)) {
+                                rootCfg.remove(version);
+                                outer.saveConfig(rootCfg.toString());
+                                JSONObject r = new JSONObject();
+                                r.put("success", true);
+                                r.put("msg", "版本 " + version + " 配置已删除");
+                                return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", r.toString());
+                            }
+                            return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.BAD_REQUEST, "application/json", "{\"err\":-1,\"msg\":\"版本 " + version + " 不存在\"}");
+                        }
+                        return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.BAD_REQUEST, "application/json", "{\"err\":-1,\"msg\":\"缺少version参数\"}");
+                    } else if ("reset".equals(action)) {
+                        // 重置为内置默认配置
+                        outer.appContext.getSharedPreferences("wxcode_config", Context.MODE_PRIVATE)
+                                .edit().remove("version_config").apply();
+                        JSONObject r = new JSONObject();
+                        r.put("success", true);
+                        r.put("msg", "配置已重置为默认值（重启生效）");
+                        return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", r.toString());
+                    }
+                    return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.BAD_REQUEST, "application/json", "{\"err\":-1,\"msg\":\"未知操作\"}");
+                } catch (Exception e) {
+                    return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "application/json", "{\"err\":-500,\"msg\":\"" + e.getMessage() + "\"}");
+                }
+            }
+
             // /login 接口：执行登录（后台唤醒逻辑已由 doLogin 内部按需处理）
             if (uri.equals("/login")) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -1125,6 +1269,73 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 sb.append("</tbody>");
                 sb.append("</table>");
                 sb.append("</div>");
+                sb.append("<h2>⚙️ 版本配置管理</h2>");
+                sb.append("<div style='background:#fff3e0;border-left:4px solid #ff9800;padding:12px 15px;border-radius:8px;margin:12px 0;font-size:0.92em;color:#5d4037'>");
+                sb.append("<strong>💡 说明：</strong><br>");
+                sb.append("您可以在此新增/修改微信版本的适配配置，保存后将持久化保存，类似保活模式的保存方式。<br>");
+                sb.append("每次保存会覆盖整个配置，新增版本前请先复制下方现有配置到文本框修改再保存。<br>");
+                sb.append("修改保存后<b>需重启微信</b>新配置才会生效。");
+                sb.append("</div>");
+                sb.append("<div style='background:#e8f4fd;border-left:4px solid #2196F3;padding:10px 15px;border-radius:8px;margin:12px 0;font-size:0.92em;color:#1565c0'>");
+                sb.append("<strong>💡 操作无响应？</strong> 点击上方按钮后如果浏览器一直无响应，请切换到微信前台再切回来（唤醒后台进程），然后重试即可。");
+                sb.append("</div>");
+                sb.append("<div style='background:#f0f4ff;border-left:4px solid #7c4dff;padding:12px 15px;border-radius:8px;margin:12px 0;font-size:0.92em;color:#4a148c'>");
+                sb.append("<strong>🤖 Hook 配置自动生成工具</strong><br>");
+                sb.append("不知道新版微信的 j1/c/a1/a7 参数？试试这个自动分析工具：");
+                sb.append("<a href='https://github.com/xiaojinwen/wxcode-hook-config' target='_blank' style='display:inline-block;margin-top:6px;padding:6px 14px;background:#7c4dff;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold'>🔗 前往 wxcode-hook-config →</a>");
+                sb.append("</div>");
+                sb.append("<h3>📝 编辑完整配置（JSON 格式）</h3>");
+                sb.append("<textarea id='configEditor' style='width:100%;height:250px;font-family:monospace;font-size:13px;padding:10px;border:1px solid #ddd;border-radius:8px;box-sizing:border-box' readonly></textarea>");
+                sb.append("<div style='display:flex;gap:8px;margin-top:8px;flex-wrap:wrap'>");
+                sb.append("<button onclick='loadConfigToEditor()' style='padding:8px 16px;font-size:13px;cursor:pointer;background:#3498db;color:#fff;border:none;border-radius:6px'>📖 加载当前配置</button>");
+                sb.append("<button onclick='saveFullConfig()' style='padding:8px 16px;font-size:13px;cursor:pointer;background:#27ae60;color:#fff;border:none;border-radius:6px'>💾 保存完整配置</button>");
+                sb.append("<button onclick='resetConfig()' style='padding:8px 16px;font-size:13px;cursor:pointer;background:#e74c3c;color:#fff;border:none;border-radius:6px'>🔄 重置为默认</button>");
+                sb.append("</div>");
+                sb.append("<h3>➕ 快速新增单个版本</h3>");
+                sb.append("<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;max-width:600px'>");
+                sb.append("<input id='fv_version' placeholder='版本号 (如 8.0.80)' style='padding:8px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;width:100%'>");
+                sb.append("<input id='fv_j1' placeholder='j1 类名 (如 hm0.j1)' style='padding:8px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;width:100%'>");
+                sb.append("<input id='fv_c' placeholder='c 类名 (如 cl0.c)' style='padding:8px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;width:100%'>");
+                sb.append("<input id='fv_a1' placeholder='a1 类名 (可选)' style='padding:8px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;width:100%'>");
+                sb.append("<input id='fv_a7' placeholder='a7 类名 (可选)' style='padding:8px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;width:100%'>");
+                sb.append("<input id='fv_j1_static' placeholder='j1_static_method (可选)' style='padding:8px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;width:100%'>");
+                sb.append("<input id='fv_j1_instance' placeholder='j1_instance_method (可选)' style='padding:8px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;width:100%'>");
+                sb.append("</div>");
+                sb.append("<div style='display:flex;gap:8px;margin-top:8px;flex-wrap:wrap'>");
+                sb.append("<button onclick='addVersion()' style='padding:8px 16px;font-size:13px;cursor:pointer;background:#9b59b6;color:#fff;border:none;border-radius:6px'>➕ 新增/更新版本</button>");
+                sb.append("</div>");
+                sb.append("<h3 style='margin-top:20px'>🗑️ 删除版本配置</h3>");
+                sb.append("<div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap'>");
+                sb.append("<input id='del_version' placeholder='要删除的版本号' style='padding:8px;border:1px solid #ddd;border-radius:6px;width:200px;box-sizing:border-box'>");
+                sb.append("<button onclick='deleteVersion()' style='padding:8px 16px;font-size:13px;cursor:pointer;background:#e74c3c;color:#fff;border:none;border-radius:6px'>🗑️ 删除</button>");
+                sb.append("</div>");
+                sb.append("<script>");
+                sb.append("async function loadConfigToEditor(){");
+                sb.append("  try{const r=await fetch('/config_raw');const t=await r.text();document.getElementById('configEditor').value=t;document.getElementById('configEditor').readOnly=false;}catch(e){alert('加载失败:'+e);}");
+                sb.append("}");
+                sb.append("async function saveFullConfig(){");
+                sb.append("  const c=document.getElementById('configEditor').value;if(!c){alert('配置内容不能为空');return;}");
+                sb.append("  try{const r=await fetch('/save_config?action=save&config='+encodeURIComponent(c));const d=await r.json();alert(d.msg);if(d.success)location.reload();}catch(e){alert('保存失败:'+e);}");
+                sb.append("}");
+                sb.append("async function addVersion(){");
+                sb.append("  const v=document.getElementById('fv_version').value;const j=document.getElementById('fv_j1').value;const c=document.getElementById('fv_c').value;");
+                sb.append("  const a1=document.getElementById('fv_a1').value;const a7=document.getElementById('fv_a7').value;");
+                sb.append("  const js=document.getElementById('fv_j1_static').value;const ji=document.getElementById('fv_j1_instance').value;");
+                sb.append("  if(!v||!j||!c){alert('版本号、j1、c 为必填项');return;}");
+                sb.append("  let url='/save_config?action=add_version&version='+encodeURIComponent(v)+'&j1='+encodeURIComponent(j)+'&c='+encodeURIComponent(c);");
+                sb.append("  if(a1)url+='&a1='+encodeURIComponent(a1);if(a7)url+='&a7='+encodeURIComponent(a7);if(js)url+='&j1_static_method='+encodeURIComponent(js);if(ji)url+='&j1_instance_method='+encodeURIComponent(ji);");
+                sb.append("  try{const r=await fetch(url);const d=await r.json();alert(d.msg);if(d.success)location.reload();}catch(e){alert('操作失败:'+e);}");
+                sb.append("}");
+                sb.append("async function deleteVersion(){");
+                sb.append("  const v=document.getElementById('del_version').value;if(!v){alert('请输入要删除的版本号');return;}");
+                sb.append("  if(!confirm('确定删除版本 '+v+' 的配置吗？'))return;");
+                sb.append("  try{const r=await fetch('/save_config?action=delete_version&version='+encodeURIComponent(v));const d=await r.json();alert(d.msg);if(d.success)location.reload();}catch(e){alert('操作失败:'+e);}");
+                sb.append("}");
+                sb.append("async function resetConfig(){");
+                sb.append("  if(!confirm('确定重置为内置默认配置？此操作不可撤销！'))return;");
+                sb.append("  try{const r=await fetch('/save_config?action=reset');const d=await r.json();alert(d.msg);location.reload();}catch(e){alert('操作失败:'+e);}");
+                sb.append("}");
+                sb.append("</script>");
                 sb.append("<div class='footer'>");
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     sb.append("© 2026 wxcode 插件 | 服务器时间：").append(LocalDateTime.now()).append("");
