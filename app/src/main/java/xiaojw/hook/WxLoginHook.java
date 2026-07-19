@@ -267,21 +267,21 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 初始化全局配置、生命周期与常驻保活
+     * 加载并合并持久化配置。必须在解析 jsonString 取 j1/c/a1/a7 之前调用，
+     * 否则用户自定义的版本配置无法生效。
      */
-    private void initConfig(Context context) {
+    private void loadSavedConfigs(Context context) {
         this.appContext = context;
         if (context instanceof Application) this.wechatApplication = (Application) context;
-        startWorkerThread();
-        // 读取持久化的保活模式，确保微信重启后用户上次选择不丢失
+        // 读取持久化的保活模式
         try {
             KeepAliveService.powerSaverMode = appContext.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
                     .getBoolean(SP_KEY_POWER_SAVER_MODE, false);
             XposedBridge.log(TAG + " 保活模式: " + (KeepAliveService.powerSaverMode ? "省电模式" : "性能模式"));
         } catch (Exception ignored) {}
-        // 记录内置默认配置原文，用于后续合并（确保内置更新不被覆盖）
+        // 记录内置默认配置原文
         defaultConfigJson = jsonString;
-        // 读取持久化的版本配置（用户自行新增的版本适配），与内置默认配置合并
+        // 读取持久化的版本配置，与内置默认配置合并
         try {
             String savedConfig = appContext.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
                     .getString(SP_KEY_VERSION_CONFIG, null);
@@ -296,9 +296,16 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 jsonString = baseCfg.toString();
                 XposedBridge.log(TAG + " 已合并持久化的版本配置（用户配置覆盖/追加到内置默认配置之上）");
             }
-        } catch (Exception ignored) {}
-        // 进程级常驻：HTTP server 启动即拉起前台 Service，确保所有 HTTP 线程
-        // （含 NanoHTTPD accept）始终受前台优先级保护，不被 Doze 限流。
+        } catch (Exception e) {
+            XposedBridge.log(TAG + " 加载持久化版本配置失败[" + e.getClass().getSimpleName() + "]:" + e.getMessage());
+        }
+    }
+
+    /**
+     * 启动后台线程和前台保活 Service（HTTP server 启动后调用）
+     */
+    private void startKeepAlive() {
+        startWorkerThread();
         startForegroundService();
     }
 
@@ -341,7 +348,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         try {
             JSONObject userCfg = new JSONObject(userConfigJson);
             appContext.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
-                    .edit().putString(SP_KEY_VERSION_CONFIG, userConfigJson).apply();
+                    .edit().putString(SP_KEY_VERSION_CONFIG, userConfigJson).commit();
             // 与内置默认配置合并（defaultConfigJson），确保内置版本更新不被覆盖
             String baseStr = defaultConfigJson != null ? defaultConfigJson : jsonString;
             JSONObject merged = new JSONObject(baseStr);
@@ -451,6 +458,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     XposedBridge.log(TAG + " 端口 " + httpPort + " 已被占用，跳过初始化");
                     return;
                 }
+                // 必须在解析版本配置之前加载用户持久化配置，
+                // 否则 jsonString 仍为内置默认值，用户自定义的版本配置不会生效
+                loadSavedConfigs(context);
                 PackageInfo pkgInfo = context.getPackageManager().getPackageInfo(currentPackageName, 0);
                 versionName = pkgInfo.versionName;
                 XposedBridge.log(TAG + " [" + currentPackageName + "] UID:" + currentUserId + " Ver:" + versionName + " Port:" + httpPort);
@@ -494,7 +504,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     } else {
                         XposedBridge.log(TAG + " 当前即主端口(8088)，负责汇总所有实例");
                     }
-                    initConfig(context);
+                    startKeepAlive();
                 } catch (IOException e) {
                     XposedBridge.log(TAG + " HTTP服务启动失败:" + e.getMessage());
                 }
@@ -776,7 +786,7 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      */
     private void resetConfig() {
         appContext.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
-                .edit().remove(SP_KEY_VERSION_CONFIG).apply();
+                .edit().remove(SP_KEY_VERSION_CONFIG).commit();
         // 回退到内置默认配置并同步 ctx
         jsonString = defaultConfigJson;
         if (httpServer != null && httpServer.getServerContext() != null) {
