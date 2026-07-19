@@ -31,9 +31,13 @@ import org.json.JSONObject;
 
 public class WxLoginHook implements IXposedHookLoadPackage {
     private static final long CALLBACK_TIMEOUT_MS = 15000;
-    private static final String DEFAULT_AUTO_APP_ID = "wxaa3a999db5d744c6";
     private static final String TAG = "xiaojw-wxcode";
     private static final String WECHAT_PACKAGE_PREFIX = "com.tencent.mm";
+
+    // SharedPreferences 键名集中管理（与 ServerContext 常量保持一致）
+    private static final String SP_NAME = ServerContext.SP_NAME;
+    private static final String SP_KEY_VERSION_CONFIG = ServerContext.SP_KEY_VERSION_CONFIG;
+    private static final String SP_KEY_POWER_SAVER_MODE = ServerContext.SP_KEY_POWER_SAVER_MODE;
 
     private LoginHttpServer httpServer;
     // 用 CAS 保证并发登录请求串行化,避免 check-then-act 竞态
@@ -43,8 +47,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     private volatile HandlerThread workerThread;
     private volatile Handler workerHandler;
     private volatile boolean isForegroundServiceRunning = false;
-    // 标志：供 KeepAliveService 上报"已真正 startForeground 完成"。
-    // 仅当它为 true 时，Android 10 的"有前台Service可后台启动Activity"豁免才成立。
     private Application wechatApplication;
 
     // 版本配置JSON（内置默认配置）
@@ -93,18 +95,34 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 获取当前进程UserID，区分多用户/系统分身
+     * 获取当前进程UserID，区分多用户/系统分身。
+     * 三种 fallback 策略已提取为独立方法，提高可读性。
      */
     private int getUserId() {
+        Integer uid = tryReflectionMyUserId();
+        if (uid != null) return uid;
+        uid = tryProcessMyUserHandle();
+        if (uid != null) return uid;
+        uid = tryDataDirParsing();
+        if (uid != null) return uid;
+        XposedBridge.log(TAG + " 无法获取UID，默认0");
+        return 0;
+    }
+
+    /** 策略1: UserHandle.myUserId() 反射调用 */
+    private Integer tryReflectionMyUserId() {
         try {
             Method myUserIdMethod = UserHandle.class.getDeclaredMethod("myUserId");
             myUserIdMethod.setAccessible(true);
-            int userId = (int) myUserIdMethod.invoke(null);
-            // XposedBridge.log(TAG + " [" + currentPackageName + "] UserHandle.myUserId 获取UID: " + userId);
-            return userId;
-        } catch (Exception e1) {
-            XposedBridge.log(TAG + " UserHandle.myUserId 失败: " + e1.getMessage());
+            return (int) myUserIdMethod.invoke(null);
+        } catch (Exception e) {
+            XposedBridge.log(TAG + " UserHandle.myUserId 失败: " + e.getMessage());
+            return null;
         }
+    }
+
+    /** 策略2: Process.myUserHandle() + mHandle Field */
+    private Integer tryProcessMyUserHandle() {
         try {
             UserHandle userHandle = android.os.Process.myUserHandle();
             if (userHandle != null) {
@@ -114,9 +132,14 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                 XposedBridge.log(TAG + " Process.myUserHandle 获取UID: " + userId);
                 return userId;
             }
-        } catch (Exception e2) {
-            XposedBridge.log(TAG + " Process.myUserHandle 失败: " + e2.getMessage());
+        } catch (Exception e) {
+            XposedBridge.log(TAG + " Process.myUserHandle 失败: " + e.getMessage());
         }
+        return null;
+    }
+
+    /** 策略3: 解析 dataDir 路径 */
+    private Integer tryDataDirParsing() {
         try {
             String dataDir = null;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -130,11 +153,10 @@ public class WxLoginHook implements IXposedHookLoadPackage {
                     return userId;
                 }
             }
-        } catch (Exception e3) {
-            XposedBridge.log(TAG + " 目录解析UID失败: " + e3.getMessage());
+        } catch (Exception e) {
+            XposedBridge.log(TAG + " 目录解析UID失败: " + e.getMessage());
         }
-        XposedBridge.log(TAG + " 无法获取UID，默认0");
-        return 0;
+        return null;
     }
 
     /**
@@ -155,9 +177,9 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      */
     private boolean isPortInUse(int port) {
         try (java.net.ServerSocket socket = new java.net.ServerSocket(port)) {
-            return false; // 端口可用
+            return false;
         } catch (IOException e) {
-            return true; // 端口已被占用
+            return true;
         }
     }
 
@@ -183,17 +205,11 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      * 读取内存实例表，实例注册后不会过期，跟随微信生命周期
      */
     private JSONArray getMemoryInstances() {
-        // ConcurrentHashMap 的迭代器支持并发修改且弱一致,无需额外 synchronized
         JSONArray result = new JSONArray();
-        java.util.Iterator<java.util.Map.Entry<String, JSONObject>> it = instanceMap.entrySet().iterator();
-        while (it.hasNext()) {
-            java.util.Map.Entry<String, JSONObject> entry = it.next();
+        for (java.util.Map.Entry<String, JSONObject> entry : instanceMap.entrySet()) {
             try {
-                JSONObject item = entry.getValue();
-                result.put(item);
-            } catch (Exception e) {
-                // 忽略异常数据
-            }
+                result.put(entry.getValue());
+            } catch (Exception ignored) {}
         }
         return result;
     }
@@ -222,7 +238,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             }
         }).start();
     }
-
 
 
     /**
@@ -260,16 +275,16 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         startWorkerThread();
         // 读取持久化的保活模式，确保微信重启后用户上次选择不丢失
         try {
-            KeepAliveService.powerSaverMode = appContext.getSharedPreferences("wxcode_config", Context.MODE_PRIVATE)
-                    .getBoolean("power_saver_mode", false);
+            KeepAliveService.powerSaverMode = appContext.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
+                    .getBoolean(SP_KEY_POWER_SAVER_MODE, false);
             XposedBridge.log(TAG + " 保活模式: " + (KeepAliveService.powerSaverMode ? "省电模式" : "性能模式"));
         } catch (Exception ignored) {}
         // 记录内置默认配置原文，用于后续合并（确保内置更新不被覆盖）
         defaultConfigJson = jsonString;
         // 读取持久化的版本配置（用户自行新增的版本适配），与内置默认配置合并
         try {
-            String savedConfig = appContext.getSharedPreferences("wxcode_config", Context.MODE_PRIVATE)
-                    .getString("version_config", null);
+            String savedConfig = appContext.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
+                    .getString(SP_KEY_VERSION_CONFIG, null);
             if (savedConfig != null && !savedConfig.isEmpty()) {
                 JSONObject baseCfg = new JSONObject(defaultConfigJson);
                 JSONObject userCfg = new JSONObject(savedConfig);
@@ -290,12 +305,10 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     /**
      * 前台保活模式：真正启动一个前台 Service，将进程优先级提升到前台，
      * 从而绕过系统对后台应用的网络限流/Doze延迟，并规避"后台启动Activity被拦截"的问题。
-     * （注意：必须在 AndroidManifest.xml 中声明 KeepAliveService）
      */
     private void startForegroundService() {
         if (isForegroundServiceRunning) return;
         try {
-            // WakeLock 由 KeepAliveService 自身持有（常驻无超时），此处只启动 Service
             Intent intent = new Intent(appContext, KeepAliveService.class);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 appContext.startForegroundService(intent);
@@ -321,15 +334,14 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 保存版本配置到 SharedPreferences（持久化），类似保活模式的保存方式
-     * 只保存用户提供的配置，启动时再与内置默认配置合并
+     * 保存版本配置到 SharedPreferences（持久化），只保存用户提供的配置，
+     * 启动时再与内置默认配置合并。
      */
     private void saveConfig(String userConfigJson) {
         try {
-            // 校验 JSON 格式
             JSONObject userCfg = new JSONObject(userConfigJson);
-            appContext.getSharedPreferences("wxcode_config", Context.MODE_PRIVATE)
-                    .edit().putString("version_config", userConfigJson).apply();
+            appContext.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
+                    .edit().putString(SP_KEY_VERSION_CONFIG, userConfigJson).apply();
             // 与内置默认配置合并（defaultConfigJson），确保内置版本更新不被覆盖
             String baseStr = defaultConfigJson != null ? defaultConfigJson : jsonString;
             JSONObject merged = new JSONObject(baseStr);
@@ -340,33 +352,38 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             }
             jsonString = merged.toString();
             XposedBridge.log(TAG + " 版本配置已持久化保存（当前内存中为合并结果）");
+            // 同步更新 ctx.jsonString，确保 HTML 缓存重建时读到最新配置
+            if (httpServer != null && httpServer.getServerContext() != null) {
+                httpServer.getServerContext().jsonString = jsonString;
+                httpServer.getServerContext().configGeneration++;
+            }
         } catch (Exception e) {
             XposedBridge.log(TAG + " 保存版本配置失败: " + e.getMessage());
         }
     }
 
     /**
-     * 切换保活模式：更新标志 + 重启 KeepAliveService 以应用新模式
+     * 切换保活模式：更新标志 + 异步重启 KeepAliveService 以应用新模式。
+     * 用 Handler.postDelayed 替代 Thread.sleep，更可靠且不阻塞调用线程。
      */
     private void switchPowerMode(boolean toPowerSaver) {
         if (KeepAliveService.powerSaverMode == toPowerSaver) return;
         KeepAliveService.powerSaverMode = toPowerSaver;
         // 持久化到 SharedPreferences，确保微信重启后模式选择不丢失
         try {
-            appContext.getSharedPreferences("wxcode_config", Context.MODE_PRIVATE)
-                    .edit().putBoolean("power_saver_mode", toPowerSaver).apply();
+            appContext.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
+                    .edit().putBoolean(SP_KEY_POWER_SAVER_MODE, toPowerSaver).apply();
         } catch (Exception ignored) {}
         XposedBridge.log(TAG + " 切换保活模式: " + (toPowerSaver ? "省电模式" : "性能模式"));
         stopForegroundService();
-        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
         isForegroundServiceRunning = false;
-        startForegroundService();
+        // 用 Handler 延迟启动替代 Thread.sleep，避免阻塞 HTTP 线程
+        Handler mainHandler = new Handler(Looper.getMainLooper());
+        mainHandler.postDelayed(this::startForegroundService, 200);
     }
 
     /**
      * 后台登录时确保前台保活 Service 已拉起，避免接口请求被系统限流卡住。
-     * 与临时拉起Activity相比，前台Service在 Android 10+ 上不受"后台启动Activity"限制，
-     * 且能真正提升进程优先级，是后台可靠性的关键。
      */
     private void ensureForegroundForBackground() {
         if (!isForegroundServiceRunning) {
@@ -386,7 +403,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
 
-
     /**
      * 启动后台轮询子线程
      */
@@ -402,9 +418,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      * 安全停止工作线程
      */
     private void stopWorkerThread() {
-        // 先清空引用再 quitSafely:quitSafely 是异步的,正在执行的 pollTask 可能仍访问
-        // workerHandler/workerThread。先置空让后续 doLogin 检测到 null 会重建,
-        // 而已入队的旧任务通过自身捕获的 handler 引用继续执行,不会读到半空状态。
         HandlerThread ht = workerThread;
         workerThread = null;
         workerHandler = null;
@@ -498,7 +511,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
         }
         final String[] res = {null};
         try {
-            // 后台登录超时
             final long timeoutMs = 30000;
             XposedBridge.log(TAG + " doLogin 前台Service运行=" + isForegroundServiceRunning + " 超时=" + timeoutMs + "ms");
             Class<?> LoginTaskCls = XposedHelpers.findClass("com.tencent.mm.plugin.appbrand.jsapi.auth.JsApiLogin$LoginTask", classLoader);
@@ -573,8 +585,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             };
             synchronized (lockObj) {
                 handler.post(pollTask);
-                // 用 while 循环检查 res[0]:即使 pollTask 在主线程进入 wait 之前就已完成并 notify,
-                // 主线程进入 synchronized 后会先检查 res[0],非空则立即退出,不会错过通知拖到超时。
                 long deadline = System.currentTimeMillis() + timeoutMs + 1000;
                 while (res[0] == null) {
                     long remaining = deadline - System.currentTimeMillis();
@@ -585,12 +595,10 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             if (res[0] == null) res[0] = "{\"err\":-210,\"msg\":\"登录超时\"}";
         } catch (Throwable e) {
             XposedBridge.log(TAG + " doLogin异常:" + e.getMessage());
-            // getMessage() 可能返回 null(如某些 NPE),直接 replace 会再次抛 NPE
             String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage().replace("\"", "\\\"");
             res[0] = "{\"err\":-500,\"msg\":\"" + msg + "\"}";
         } finally {
             isLoginInFlight.set(false);
-            // 前台 Service 现为 HTTP server 常驻依赖，不在登录结束时停止
         }
         return res[0];
     }
@@ -614,23 +622,20 @@ public class WxLoginHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * 匹配8参数构造函数，兼容微信内部类
+     * 匹配8参数构造函数，兼容微信内部类。
+     * 使用 getParameterTypes().length 替代 getParameterCount()，兼容 API < 26。
      */
     private Constructor<?> findHe0cConstructor(Class<?> clazz) {
         for (Constructor<?> c : clazz.getDeclaredConstructors()) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                if (c.getParameterCount() == 8) {
-                    c.setAccessible(true);
-                    return c;
-                }
+            if (c.getParameterTypes().length == 8) {
+                c.setAccessible(true);
+                return c;
             }
         }
         for (Constructor<?> c : clazz.getDeclaredConstructors()) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                if (c.getParameterCount() >= 6) {
-                    c.setAccessible(true);
-                    return c;
-                }
+            if (c.getParameterTypes().length >= 6) {
+                c.setAccessible(true);
+                return c;
             }
         }
         throw new RuntimeException("未找到目标构造函数:" + clazz.getName());
@@ -729,8 +734,6 @@ public class WxLoginHook implements IXposedHookLoadPackage {
             @Override
             public void saveConfig(String configJson) {
                 WxLoginHook.this.saveConfig(configJson);
-                // 同步更新 ctx.jsonString，确保后续 HTTP 请求读到最新配置
-                ctx.jsonString = WxLoginHook.this.jsonString;
             }
             @Override
             public String doLogin(String appId, ClassLoader cl) {
@@ -772,7 +775,13 @@ public class WxLoginHook implements IXposedHookLoadPackage {
      * 重置版本配置为默认值（仅移除持久化的用户配置，不影响内置默认配置）
      */
     private void resetConfig() {
-        appContext.getSharedPreferences("wxcode_config", Context.MODE_PRIVATE)
-                .edit().remove("version_config").apply();
+        appContext.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
+                .edit().remove(SP_KEY_VERSION_CONFIG).apply();
+        // 回退到内置默认配置并同步 ctx
+        jsonString = defaultConfigJson;
+        if (httpServer != null && httpServer.getServerContext() != null) {
+            httpServer.getServerContext().jsonString = jsonString;
+            httpServer.getServerContext().configGeneration++;
+        }
     }
 }

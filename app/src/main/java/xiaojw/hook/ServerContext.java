@@ -11,6 +11,18 @@ import org.json.JSONArray;
  */
 public class ServerContext {
 
+    // ========== SharedPreferences 常量 ==========
+
+    public static final String SP_NAME = "wxcode_config";
+    public static final String SP_KEY_VERSION_CONFIG = "version_config";
+    public static final String SP_KEY_POWER_SAVER_MODE = "power_saver_mode";
+
+    // ========== 静态常量 ==========
+
+    public static final String COMMON_PACKAGE = "com.tencent.mm";
+    public static final int MASTER_PORT = 8088;
+    public static final String DEFAULT_AUTO_APP_ID = "wxaa3a999db5d744c6";
+
     // ========== 实例数据字段 ==========
 
     public String currentPackageName;
@@ -21,11 +33,11 @@ public class ServerContext {
     public String j1StaticMethod, j1InstanceMethod;
     public String jsonString;
 
-    // ========== 静态常量 ==========
-
-    public static final String COMMON_PACKAGE = "com.tencent.mm";
-    public static final int MASTER_PORT = 8088;
-    public static final String DEFAULT_AUTO_APP_ID = "wxaa3a999db5d744c6";
+    /**
+     * 配置版本号，每次 saveConfig/resetConfig 时递增。
+     * LoginHttpServer 通过比对此值判断 HTML 缓存是否需要刷新。
+     */
+    public volatile long configGeneration = 0;
 
     // ========== 方法回调 ==========
 

@@ -152,6 +152,7 @@ public class KeepAliveService extends Service {
     public void onDestroy() {
         fgServiceActive = false;
         cancelAlarm();
+        alarmPendingIntent = null;  // 显式置空，避免持有旧 Service 引用
         if (serviceWakeLock != null && serviceWakeLock.isHeld()) {
             try { serviceWakeLock.release(); } catch (Exception ignored) {}
         }
