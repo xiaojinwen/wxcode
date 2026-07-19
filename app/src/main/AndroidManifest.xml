@@ -33,7 +33,7 @@
 
         <!-- 前台保活 Service：把微信进程优先级提升到前台，解决后台接口请求被限流卡住的问题 -->
         <service
-            android:name=".hook.WxLoginHook$KeepAliveService"
+            android:name=".hook.KeepAliveService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
     </application>
