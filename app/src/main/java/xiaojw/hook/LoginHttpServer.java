@@ -249,7 +249,7 @@ public class LoginHttpServer extends NanoHTTPD {
         if (uri.equals("/login")) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 return jsonResponse(Response.Status.OK,
-                        ctx.methods.doLogin(iHTTPSession.getParms().getOrDefault("appId", ServerContext.DEFAULT_AUTO_APP_ID), classLoader));
+                        ctx.methods.doLogin(iHTTPSession.getParms().getOrDefault("appId", ServerContext.getDefaultAutoAppId()), classLoader));
             }
         }
 
