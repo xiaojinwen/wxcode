@@ -38,7 +38,7 @@ Visit `http://127.0.0.1:8088` in browser to view instance info and version compa
 
 | Endpoint | Description | Example |
 |----------|-------------|---------|
-| `/login` | Execute login and get code | `/login?appId=wxaa3a999db5d744c6` |
+| `/login` | Execute login and get code | `/login?appId=<YOUR_MINI_PROGRAM_APPID>` |
 | `/whoami` | Return current instance info | `/whoami` |
 | `/instances` | Return all running instances | `/instances` |
 | `/config` | View/switch keep-alive mode | `/config?mode=power_saver` |

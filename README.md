@@ -38,7 +38,7 @@
 
 | 接口 | 说明 | 示例 |
 |------|------|------|
-| `/login` | 执行登录获取 code | `/login?appId=wxaa3a999db5d744c6` |
+| `/login` | 执行登录获取 code | `/login?appId=你的小程序AppID` |
 | `/whoami` | 返回当前实例信息 | `/whoami` |
 | `/instances` | 返回所有已启动实例 | `/instances` |
 | `/config` | 查看/切换保活模式 | `/config?mode=power_saver` |
