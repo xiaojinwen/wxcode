@@ -93,11 +93,37 @@ A: Visit `http://127.0.0.1:8088/whoami` to view current instance info.
 
 ## Disclaimer
 
-This project is for educational and research purposes only. Do not use it for illegal purposes. Users are solely responsible for any consequences resulting from the use of this module.
+This project is for educational and research purposes only. By using this project, you agree to the following terms:
+
+1. **Educational Use**: The source code is for personal learning and research use only. Do not use it for commercial profit or illegal activities.
+2. **Risk Assumption**: Any direct or indirect consequences resulting from the use of this project (including but not limited to device damage, data loss, account bans, etc.) are borne by the user. The developers assume no liability.
+3. **Legal Compliance**: Users must ensure their usage complies with local laws and regulations, especially regarding privacy and cybersecurity requirements.
+4. **No Warranty**: This project is provided "as is" without any express or implied warranties, including but not limited to warranties of merchantability, fitness for a particular purpose, and non-infringement.
+5. **Third-Party Risks**: This project may reference or depend on third-party components. Users must comply with relevant third-party open source licenses.
 
 ## License
 
 MIT License
+
+Copyright (c) 2024 xiaojinwen
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ## Contributing
 

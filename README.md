@@ -93,11 +93,37 @@ A: 访问 `http://127.0.0.1:8088/whoami` 查看当前实例信息。
 
 ## 免责声明
 
-本项目仅供学习研究，请勿用于非法用途。使用本模块产生的一切后果由使用者自行承担。
+本项目仅供学习研究目的。使用者必须遵守以下条款：
+
+1. **学习研究用途**：本项目代码仅供个人学习和研究使用，不得用于商业盈利或非法活动。
+2. **风险自担**：使用本项目产生的任何直接或间接后果（包括但不限于设备损坏、数据丢失、账号被封禁等），由使用者完全自行承担。开发者不承担任何责任。
+3. **合法合规**：使用者须自行负责确保使用行为符合所在地区的法律法规，特别是涉及隐私、网络安全等方面的要求。
+4. **无保证**：本项目按“原样”提供，不提供任何形式的明示或暗示保证，包括适销性、特定用途适用性和非侵权性的保证。
+5. **第三方风险**：项目可能引用或依赖第三方组件，使用者需自行遵守相关第三方开源协议。
 
 ## 开源协议
 
 MIT License
+
+Copyright (c) 2024 xiaojinwen
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ## 贡献指南
 
