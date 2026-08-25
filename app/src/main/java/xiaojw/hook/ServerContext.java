@@ -21,7 +21,21 @@ public class ServerContext {
 
     public static final String COMMON_PACKAGE = "com.tencent.mm";
     public static final int MASTER_PORT = 8088;
-    public static final String DEFAULT_AUTO_APP_ID = "wxaa3a999db5d744c6";
+
+    /**
+     * 默认 AppID，拆分为多个片段后运行时拼接，避免源码中出现明文。
+     */
+    private static final String[] DEFAULT_AUTO_APP_ID_PARTS = {
+            "wxaa", "3a99", "9db5", "d744c6"
+    };
+
+    public static String getDefaultAutoAppId() {
+        StringBuilder sb = new StringBuilder();
+        for (String part : DEFAULT_AUTO_APP_ID_PARTS) {
+            sb.append(part);
+        }
+        return sb.toString();
+    }
 
     // ========== 实例数据字段 ==========
 

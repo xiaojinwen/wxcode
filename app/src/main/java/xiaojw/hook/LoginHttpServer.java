@@ -506,7 +506,7 @@ public class LoginHttpServer extends NanoHTTPD {
         sb.append("<tbody>");
         sb.append("<tr><td><code>/whoami</code></td><td>返回当前实例信息(JSON)</td><td><a href='/whoami'>点击查看</a></td></tr>");
         sb.append("<tr><td><code>/instances</code></td><td>返回端口映射表(JSON)</td><td><a href='/instances'>点击查看</a></td></tr>");
-        sb.append("<tr><td><code>/login</code></td><td>执行登录获取code</td><td><a href='/login?appId=wxaa3a999db5d744c6'>点击测试</a></td></tr>");
+        sb.append("<tr><td><code>/login</code></td><td>执行登录获取code</td><td><a href='/login?appId=" + ServerContext.getDefaultAutoAppId() + "'>点击测试</a></td></tr>");
         sb.append("</tbody></table>");
 
         sb.append("<h2>⚡ 保活模式切换</h2>");
